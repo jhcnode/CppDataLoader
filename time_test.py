@@ -2,7 +2,7 @@ import time
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-import CppDataLoader as core_loader # C++ 모듈 (setup.py 빌드 후 생성됨)
+import FastDataLoader as core_loader # C++ 모듈 (setup.py 빌드 후 생성됨)
 from tqdm import tqdm
 
 
@@ -21,10 +21,10 @@ class DummyDataset:
 def reader(idx):
     return dataset[idx]
 
-# C++ 모듈의 CppDataLoader 객체를 감싸는 wrapper 클래스
-class CppDataLoader:
+# C++ 모듈의 FastDataLoader 객체를 감싸는 wrapper 클래스
+class FastDataLoader:
     def __init__(self, reader, dataset_len, batch_size, num_workers, shuffle, drop_last,persistent_workers,prefetch_count):
-        self.loader = core_loader.CppDataLoader(
+        self.loader = core_loader.FastDataLoader(
             reader,
             dataset_len,
             batch_size,
@@ -64,7 +64,7 @@ torch_dataset = DummyDataset()
 
 # # Wrapper 객체 생성
 # # === C++ DataLoader (our new prefetch version) ===
-cpp_loader = CppDataLoader(
+cpp_loader = FastDataLoader(
     reader=reader,
     dataset_len=len(dataset),
     batch_size=100,
@@ -111,5 +111,5 @@ for _ in tqdm(range(trial),desc="torch-dataloader prog"):
     torch_time = time.perf_counter() - start_time
     torch_total_time+=torch_time
 
-print("CppDataLoader(proposed) elapsed avg time(trial:{}): {:.6f} seconds".format(trial,cpp_total_time/trial))
+print("FastDataLoader(proposed) elapsed avg time(trial:{}): {:.6f} seconds".format(trial,cpp_total_time/trial))
 print("PyTorch DataLoader elapsed avg time(trial:{}): {:.6f} seconds".format(trial,torch_total_time/trial)) 

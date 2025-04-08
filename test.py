@@ -1,5 +1,5 @@
 import numpy as np
-import CppDataLoader as core_loader  # C++ 모듈 (setup.py 빌드 후 생성됨)
+import FastDataLoader as core_loader  # C++ 모듈 (setup.py 빌드 후 생성됨)
 from tqdm import tqdm
 
 # 가짜 Dataset 시뮬레이션
@@ -19,10 +19,10 @@ dataset = DummyDataset()
 def reader(idx):
     return dataset[idx]
 
-# C++ 모듈의 CppDataLoader 객체를 감싸는 wrapper 클래스
-class CppDataLoaderWrapper:
+# C++ 모듈의 FastDataLoader 객체를 감싸는 wrapper 클래스
+class FastDataLoaderWrapper:
     def __init__(self, reader, dataset_len, batch_size, num_workers, shuffle, drop_last, persistent_workers,prefetch_count):
-        self.loader = core_loader.CppDataLoader(
+        self.loader = core_loader.FastDataLoader(
             reader,
             dataset_len,
             batch_size,
@@ -56,7 +56,7 @@ class CppDataLoaderWrapper:
         return batch
 
 # Wrapper 객체 생성
-loader = CppDataLoaderWrapper(
+loader = FastDataLoaderWrapper(
     reader=reader,
     dataset_len=len(dataset),
     batch_size=100,

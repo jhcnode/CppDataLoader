@@ -1,4 +1,4 @@
-// CppDataLoader 전체 코드 - multiprocess prefetching 적용 버전
+// FastDataLoader 전체 코드 - multiprocess prefetching 적용 버전
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -81,7 +81,7 @@ py::object deserialize_python_object(const char* data, size_t size) {
     return unpackb(bytes_obj, py::arg("raw") = false);
 }
 
-class CppDataLoader {
+class FastDataLoader {
 public:
     // 기존 worker 관련 코드는 그대로 유지
     struct Worker {
@@ -91,7 +91,7 @@ public:
     };
 
     // prefetch_count 옵션 (미리 로드할 배치 개수; multiprocess 방식에서는 파이프 버퍼로 관리)
-    CppDataLoader(py::object reader, size_t dataset_len, size_t batch_size,
+    FastDataLoader(py::object reader, size_t dataset_len, size_t batch_size,
                   size_t num_workers, bool shuffle, bool drop_last,
                   bool persistent_workers = true, size_t prefetch_count = 5)
         : reader_(reader), dataset_len_(dataset_len), batch_size_(batch_size),
@@ -129,7 +129,7 @@ public:
         }
     }
 
-    ~CppDataLoader() {
+    ~FastDataLoader() {
         // prefetch 프로세스 종료 요청
         if (prefetch_pid_ > 0) {
             kill(prefetch_pid_, SIGTERM);
@@ -375,9 +375,9 @@ private:
     }
 };
 
-PYBIND11_MODULE(CppDataLoader, m) {
+PYBIND11_MODULE(FastDataLoader, m) {
     m.doc() = "C++ DataLoader with POSIX SHM + Msgpack Protocol for all Python objects (multiprocess prefetching 적용)";
-    py::class_<CppDataLoader>(m, "CppDataLoader")
+    py::class_<FastDataLoader>(m, "FastDataLoader")
         .def(py::init<py::object, size_t, size_t, size_t, bool, bool, bool, size_t>(),
              py::arg("reader"),
              py::arg("dataset_len"),
@@ -387,6 +387,6 @@ PYBIND11_MODULE(CppDataLoader, m) {
              py::arg("drop_last"),
              py::arg("persistent_workers"),
              py::arg("prefetch_count") = 5,
-             "Initialize CppDataLoader with dataset reader and settings")
-        .def("__call__", &CppDataLoader::operator(), "Fetch next batch from prefetch pipe");
+             "Initialize FastDataLoader with dataset reader and settings")
+        .def("__call__", &FastDataLoader::operator(), "Fetch next batch from prefetch pipe");
 }
