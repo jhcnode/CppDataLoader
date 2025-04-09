@@ -59,23 +59,18 @@ static void capsule_destructor(void* p) {
 }
 
 std::string serialize_python_object(const py::object& obj) {
-    py::module msgpack = py::module::import("msgpack");
-    py::object packb = msgpack.attr("packb");
-    py::bytes data = packb(obj, 
-                             py::arg("use_bin_type") = true,
-                             py::arg("default") = py::cpp_function([](py::object o) {
-                                 if (py::isinstance<py::array>(o))
-                                     return o.attr("tolist")();
-                                 throw std::runtime_error("Cannot serialize object");
-                             }));
+    py::module pickle = py::module::import("pickle");
+    py::object dumps = pickle.attr("dumps");
+    // protocol 4 이상을 사용하면 최신 형식으로 직렬화됨 (numpy array 등도 그대로 보존됨)
+    py::bytes data = dumps(obj, py::arg("protocol") = 4);
     return std::string(data);
 }
 
 py::object deserialize_python_object(const char* data, size_t size) {
-    py::module msgpack = py::module::import("msgpack");
-    py::object unpackb = msgpack.attr("unpackb");
-    py::bytes bytes_obj = py::bytes(data, size);
-    return unpackb(bytes_obj, py::arg("raw") = false);
+    py::module pickle = py::module::import("pickle");
+    py::object loads = pickle.attr("loads");
+    py::bytes bytes_obj(data, size);
+    return loads(bytes_obj);
 }
 
 class FastDataLoader {
@@ -202,24 +197,30 @@ private:
         workers_.clear();
     }
 
-    py::list load_chunked_in_workers(const std::vector<size_t>& batch_indices) {
+    py::dict load_chunked_in_workers(const std::vector<size_t>& batch_indices) {
         py::gil_scoped_acquire gil;
-        py::list out;
+        py::dict out;  // 최종 결과를 담을 dict
+
         size_t total = batch_indices.size();
         size_t chunks = workers_.size();
         size_t chunk_size = (total + chunks - 1) / chunks;
         std::vector<pollfd> pfds(chunks);
+
+        // 각 워커의 result_fd 설정
         for (size_t i = 0; i < chunks; ++i)
-            pfds[i] = {workers_[i].result_fd, POLLIN, 0};
+            pfds[i] = { workers_[i].result_fd, POLLIN, 0 };
+
+        // 각 워커에 작업(Task) 할당
         for (size_t i = 0; i < chunks; ++i) {
             size_t start = i * chunk_size;
             size_t end = std::min(start + chunk_size, total);
             if (start >= end)
                 continue;
-            ChunkTaskHeader hdr = {i, end - start};
+            ChunkTaskHeader hdr = { i, end - start };
             ::write(workers_[i].task_fd, &hdr, sizeof(hdr));
             ::write(workers_[i].task_fd, batch_indices.data() + start, (end - start) * sizeof(uint64_t));
         }
+
         size_t completed = 0;
         while (completed < chunks) {
             poll(pfds.data(), pfds.size(), -1);
@@ -233,30 +234,65 @@ private:
                     shm_unlink(shm_name.c_str());
                     void* addr = mmap(nullptr, rh.data_size, PROT_READ, MAP_SHARED, fd, 0);
                     close(fd);
-                    auto* ctx = new MMapContext{addr, rh.data_size};
+                    auto* ctx = new MMapContext{ addr, rh.data_size };
                     py::capsule base(ctx, &capsule_destructor);
+
+                    // 샘플 복원: TYPE_NUMPY인 경우엔 numpy array, 그렇지 않으면 deserialize하여 object 복원
+                    py::object sample;
                     if (rh.data_type == TYPE_NUMPY) {
-                        std::vector<py::ssize_t> shape = {rh.shape0, rh.shape1, rh.shape2, rh.shape3};
+                        std::vector<py::ssize_t> shape = { rh.shape0, rh.shape1, rh.shape2, rh.shape3 };
                         std::vector<py::ssize_t> strides = {
-                            rh.shape1 * rh.shape2 * rh.shape3 * sizeof(float),
-                            rh.shape2 * rh.shape3 * sizeof(float),
-                            rh.shape3 * sizeof(float),
+                            static_cast<py::ssize_t>(rh.shape1) * rh.shape2 * rh.shape3 * sizeof(float),
+                            static_cast<py::ssize_t>(rh.shape2) * rh.shape3 * sizeof(float),
+                            static_cast<py::ssize_t>(rh.shape3) * sizeof(float),
                             sizeof(float)
                         };
                         py::array arr(py::buffer_info(addr, sizeof(float),
-                                                      py::format_descriptor<float>::format(),
-                                                      4, shape, strides), base);
-                        out.append(arr);
+                                                    py::format_descriptor<float>::format(),
+                                                    4, shape, strides), base);
+                        sample = arr;
                     } else {
-                        py::object obj = deserialize_python_object(static_cast<char*>(addr), rh.data_size);
-                        out.append(obj);
+                        sample = deserialize_python_object(static_cast<char*>(addr), rh.data_size);
+                    }
+
+                    // 샘플이 dict 타입이면, reader에서 반환받은 키를 사용하여 각 key별로 데이터를 병합(concatenate)
+                    if (py::isinstance<py::dict>(sample)) {
+                        py::dict sample_dict = sample.cast<py::dict>();
+                        for (auto item : sample_dict) {
+                            // key와 value를 py::object로 변환 (py::handle -> py::object)
+                            py::object key_obj = py::reinterpret_borrow<py::object>(item.first);
+                            py::object value_obj = py::reinterpret_borrow<py::object>(item.second);
+                            // key를 문자열로 변환 (msgpack serialize 가능하도록)
+                            py::object key_str = py::str(key_obj);
+                            if (out.contains(key_str)) {
+                                py::module numpy = py::module::import("numpy");
+                                py::tuple tup = py::make_tuple(out[key_str], value_obj);
+                                py::object combined = numpy.attr("concatenate")(tup, py::arg("axis") = 0);
+                                out[key_str] = combined;
+                            } else {
+                                out[key_str] = value_obj;
+                            }
+                        }
+                    } else {
+                        // 샘플이 dict가 아니면, 기본 키 "data" 사용
+                        py::object default_key = py::str("data");
+                        if (out.contains(default_key)) {
+                            py::module numpy = py::module::import("numpy");
+                            py::tuple tup = py::make_tuple(out[default_key], sample);
+                            py::object combined = numpy.attr("concatenate")(tup, py::arg("axis") = 0);
+                            out[default_key] = combined;
+                        } else {
+                            out[default_key] = sample;
+                        }
                     }
                     completed++;
                 }
             }
         }
-        return out;
+        return out;  // 최종적으로 dict 반환 (키는 reader에서 반환받은 값)
     }
+
+
 
     void prefetch_loop() {
         while (true) {
