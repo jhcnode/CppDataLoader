@@ -1,4 +1,3 @@
-// FastDataLoader 전체 코드 - multiprocess prefetching 적용 버전
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -59,11 +58,9 @@ static void capsule_destructor(void* p) {
     delete ctx;
 }
 
-// numpy.ndarray이면 tolist()로 변환하도록 default lambda 지정
 std::string serialize_python_object(const py::object& obj) {
     py::module msgpack = py::module::import("msgpack");
     py::object packb = msgpack.attr("packb");
-    // 만약 obj가 numpy array이면 tolist()로 변환하여 직렬화
     py::bytes data = packb(obj, 
                              py::arg("use_bin_type") = true,
                              py::arg("default") = py::cpp_function([](py::object o) {
@@ -89,8 +86,7 @@ public:
         int task_fd;
         int result_fd;
     };
-
-    // prefetch_count 옵션 (미리 로드할 배치 개수; multiprocess 방식에서는 파이프 버퍼로 관리)
+    
     FastDataLoader(py::object reader, size_t dataset_len, size_t batch_size,
                   size_t num_workers, bool shuffle, bool drop_last,
                   bool persistent_workers = true, size_t prefetch_count = 5)
@@ -117,20 +113,16 @@ public:
         if (pid < 0) {
             throw std::runtime_error("fork 실패");
         } else if (pid == 0) {
-            // 자식 프로세스: prefetch 프로세스
-            // 부모와의 통신을 위해 읽기 fd 닫기
             close(prefetch_pipe_[0]);
             prefetch_loop();
             _exit(0);
         } else {
-            // 부모 프로세스: prefetch 프로세스의 pid 저장, 읽기 fd 유지
             prefetch_pid_ = pid;
             close(prefetch_pipe_[1]);
         }
     }
 
     ~FastDataLoader() {
-        // prefetch 프로세스 종료 요청
         if (prefetch_pid_ > 0) {
             kill(prefetch_pid_, SIGTERM);
             waitpid(prefetch_pid_, nullptr, 0);
@@ -139,9 +131,7 @@ public:
             shutdown_workers();
     }
 
-    // __call__에서는 prefetch 파이프에서 직렬화된 배치를 읽어 msgpack으로 역직렬화한 후 반환합니다.
     py::object operator()() {
-        // 먼저 배치의 크기를 읽습니다 (4바이트 정수)
         uint32_t batch_size_bytes;
         ssize_t n = read(prefetch_pipe_[0], &batch_size_bytes, sizeof(batch_size_bytes));
         if (n != sizeof(batch_size_bytes))
@@ -164,11 +154,9 @@ private:
     size_t current_index_, epoch_count_;
     std::vector<size_t> indices_;
     std::vector<Worker> workers_;
-
-    // prefetch 프로세스와 통신하기 위한 파이프: prefetch_pipe_[0]는 부모 읽기용, [1]는 자식 쓰기용
     int prefetch_pipe_[2];
     pid_t prefetch_pid_;
-    size_t prefetch_count_; // 사용되지 않지만 옵션으로 남겨둠
+    size_t prefetch_count_;
 
     void end_epoch() {
         epoch_count_++;
@@ -212,15 +200,6 @@ private:
             waitpid(w.pid, nullptr, 0);
         }
         workers_.clear();
-    }
-
-    py::list load_in_main(const std::vector<size_t>& batch_indices) {
-        py::gil_scoped_acquire gil;
-        py::list out;
-        py::object rdr = get_global_reader();
-        for (auto i : batch_indices)
-            out.append(rdr(i));
-        return out;
     }
 
     py::list load_chunked_in_workers(const std::vector<size_t>& batch_indices) {
@@ -279,11 +258,8 @@ private:
         return out;
     }
 
-    // prefetch_loop: 별도 프로세스에서 배치를 미리 로드하여 파이프에 직렬화된 데이터를 씁니다.
     void prefetch_loop() {
-        // prefetch 프로세스 내에서는 Python 인터프리터가 별도로 실행되므로 GIL 문제 없이 호출 가능
         while (true) {
-            // 만약 데이터셋 끝에 도달하면 epoch 종료 처리
             if (current_index_ >= dataset_len_)
                 end_epoch();
             std::vector<size_t> batch_indices(
@@ -291,37 +267,10 @@ private:
                 indices_.begin() + std::min(current_index_ + batch_size_, dataset_len_)
             );
             current_index_ += batch_size_;
-            py::object batch;
-            if (num_workers_ == 0)
-                batch = load_in_main(batch_indices);
-            else
-                batch = load_chunked_in_workers(batch_indices);
-            // dict 배치라면 key별로 배치화 처리
-            py::list batch_list = batch.cast<py::list>();
-            if (batch_list.size() > 0 && py::isinstance<py::dict>(batch_list[0])) {
-                py::dict batched;
-                py::dict first = batch_list[0].cast<py::dict>();
-                py::object np = py::module::import("numpy");
-                for (auto item : first) {
-                    py::object key = py::reinterpret_borrow<py::object>(item.first);
-                    py::list values;
-                    for (auto sample : batch_list) {
-                        py::dict sample_dict = sample.cast<py::dict>();
-                        values.append(sample_dict[key]);
-                    }
-                    if (values.size() > 0 && py::isinstance<py::array>(values[0]))
-                        batched[key] = np.attr("stack")(values);
-                    else
-                        batched[key] = np.attr("array")(values);
-                }
-                batch = batched;
-            }
-            // 직렬화: prefetch 프로세스에서는 배치를 msgpack으로 직렬화하여 파이프에 기록합니다.
+            py::object batch = load_chunked_in_workers(batch_indices);
             std::string serialized = serialize_python_object(batch);
             uint32_t size32 = serialized.size();
-            // 먼저 직렬화된 데이터 크기를 4바이트 정수로 기록하고,
             write(prefetch_pipe_[1], &size32, sizeof(size32));
-            // 그 다음 직렬화된 데이터를 기록합니다.
             write(prefetch_pipe_[1], serialized.data(), serialized.size());
         }
     }
@@ -386,7 +335,6 @@ PYBIND11_MODULE(FastDataLoader, m) {
              py::arg("shuffle"),
              py::arg("drop_last"),
              py::arg("persistent_workers"),
-             py::arg("prefetch_count") = 5,
-             "Initialize FastDataLoader with dataset reader and settings")
+             py::arg("prefetch_count") = 5)
         .def("__call__", &FastDataLoader::operator(), "Fetch next batch from prefetch pipe");
 }
