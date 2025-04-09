@@ -38,12 +38,13 @@ struct ChunkTaskHeader {
     uint64_t num_indices;
 };
 
+// ShmResultHeader에 ndim 필드를 추가하고, shape 정보는 header 이후에 연속으로 기록함
 struct ShmResultHeader {
     uint64_t chunk_id;
     uint64_t shm_name_len;
     uint64_t data_size;
     uint8_t data_type;
-    int64_t shape0, shape1, shape2, shape3;
+    uint8_t ndim; // numpy 배열의 차원 수 (variable length shape 정보가 header 다음에 기록됨)
 };
 
 struct MMapContext {
@@ -61,7 +62,6 @@ static void capsule_destructor(void* p) {
 std::string serialize_python_object(const py::object& obj) {
     py::module pickle = py::module::import("pickle");
     py::object dumps = pickle.attr("dumps");
-    // protocol 4 이상을 사용하면 최신 형식으로 직렬화됨 (numpy array 등도 그대로 보존됨)
     py::bytes data = dumps(obj, py::arg("protocol") = 4);
     return std::string(data);
 }
@@ -75,7 +75,6 @@ py::object deserialize_python_object(const char* data, size_t size) {
 
 class FastDataLoader {
 public:
-    // 기존 worker 관련 코드는 그대로 유지
     struct Worker {
         pid_t pid;
         int task_fd;
@@ -83,8 +82,8 @@ public:
     };
     
     FastDataLoader(py::object reader, size_t dataset_len, size_t batch_size,
-                  size_t num_workers, bool shuffle, bool drop_last,
-                  bool persistent_workers = true, size_t prefetch_count = 5)
+                   size_t num_workers, bool shuffle, bool drop_last,
+                   bool persistent_workers = true, size_t prefetch_count = 5)
         : reader_(reader), dataset_len_(dataset_len), batch_size_(batch_size),
           num_workers_(num_workers), shuffle_(shuffle), drop_last_(drop_last),
           persistent_workers_(persistent_workers), current_index_(0), epoch_count_(0),
@@ -101,7 +100,6 @@ public:
         if (persistent_workers_ && num_workers_ > 0)
             spawn_workers();
 
-        // prefetch 파이프 생성 (부모: prefetch_read_fd, 자식: prefetch_write_fd)
         if (pipe(prefetch_pipe_) < 0)
             throw std::runtime_error("pipe 생성 실패");
         pid_t pid = fork();
@@ -181,14 +179,14 @@ private:
             } else {
                 close(task_pipe[0]);
                 close(result_pipe[1]);
-                workers_[i] = Worker{pid, task_pipe[1], result_pipe[0]};
+                workers_[i] = Worker{ pid, task_pipe[1], result_pipe[0] };
             }
         }
     }
 
     void shutdown_workers() {
         for (auto& w : workers_) {
-            ChunkTaskHeader hdr = {0, std::numeric_limits<uint64_t>::max()};
+            ChunkTaskHeader hdr = { 0, std::numeric_limits<uint64_t>::max() };
             ::write(w.task_fd, &hdr, sizeof(hdr));
             close(w.task_fd);
             close(w.result_fd);
@@ -197,20 +195,23 @@ private:
         workers_.clear();
     }
 
+    // load_chunked_in_workers: 최종 배치 데이터를 dict 형태로 반환함
+    // 만약 샘플이 numpy array인 경우, header에 기록된 ndim과 shape 정보를 이용하여 배열을 복원함.
     py::dict load_chunked_in_workers(const std::vector<size_t>& batch_indices) {
         py::gil_scoped_acquire gil;
-        py::dict out;  // 최종 결과를 담을 dict
+        // 중간 버퍼: 키별로 파트별 데이터를 저장할 dict (키: vector of py::object)
+        std::unordered_map<std::string, std::vector<py::object>> merge_buffer;
+        // 만약 결과가 단일 값("data")인 경우도 저장할 리스트
+        std::vector<py::object> default_buffer;
 
         size_t total = batch_indices.size();
         size_t chunks = workers_.size();
         size_t chunk_size = (total + chunks - 1) / chunks;
         std::vector<pollfd> pfds(chunks);
 
-        // 각 워커의 result_fd 설정
         for (size_t i = 0; i < chunks; ++i)
             pfds[i] = { workers_[i].result_fd, POLLIN, 0 };
 
-        // 각 워커에 작업(Task) 할당
         for (size_t i = 0; i < chunks; ++i) {
             size_t start = i * chunk_size;
             size_t end = std::min(start + chunk_size, total);
@@ -226,10 +227,23 @@ private:
             poll(pfds.data(), pfds.size(), -1);
             for (size_t i = 0; i < chunks; ++i) {
                 if (pfds[i].revents & POLLIN) {
+                    // 고정 길이 헤더 읽기
                     ShmResultHeader rh;
-                    ::read(pfds[i].fd, &rh, sizeof(rh));
+                    ssize_t ret = ::read(pfds[i].fd, &rh, sizeof(rh));
+                    if(ret != sizeof(rh))
+                        throw std::runtime_error("Failed to read header");
+
+                    // shape 정보 읽기 (numpy인 경우)
+                    int ndim = static_cast<int>(rh.ndim);
+                    std::vector<int64_t> shape_vec(ndim);
+                    ret = ::read(pfds[i].fd, shape_vec.data(), ndim * sizeof(int64_t));
+                    if(ret != ndim * static_cast<ssize_t>(sizeof(int64_t)))
+                        throw std::runtime_error("Failed to read shape info");
+
+                    // shm 이름 읽기
                     std::string shm_name(rh.shm_name_len, '\0');
                     ::read(pfds[i].fd, &shm_name[0], rh.shm_name_len);
+
                     int fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
                     shm_unlink(shm_name.c_str());
                     void* addr = mmap(nullptr, rh.data_size, PROT_READ, MAP_SHARED, fd, 0);
@@ -237,61 +251,72 @@ private:
                     auto* ctx = new MMapContext{ addr, rh.data_size };
                     py::capsule base(ctx, &capsule_destructor);
 
-                    // 샘플 복원: TYPE_NUMPY인 경우엔 numpy array, 그렇지 않으면 deserialize하여 object 복원
                     py::object sample;
                     if (rh.data_type == TYPE_NUMPY) {
-                        std::vector<py::ssize_t> shape = { rh.shape0, rh.shape1, rh.shape2, rh.shape3 };
-                        std::vector<py::ssize_t> strides = {
-                            static_cast<py::ssize_t>(rh.shape1) * rh.shape2 * rh.shape3 * sizeof(float),
-                            static_cast<py::ssize_t>(rh.shape2) * rh.shape3 * sizeof(float),
-                            static_cast<py::ssize_t>(rh.shape3) * sizeof(float),
-                            sizeof(float)
-                        };
+                        std::vector<py::ssize_t> shape(ndim);
+                        for (int j = 0; j < ndim; ++j)
+                            shape[j] = static_cast<py::ssize_t>(shape_vec[j]);
+                        std::vector<py::ssize_t> strides(ndim);
+                        if(ndim > 0) {
+                            strides[ndim-1] = sizeof(float);
+                            for (int j = ndim - 2; j >= 0; --j)
+                                strides[j] = shape[j+1] * strides[j+1];
+                        }
                         py::array arr(py::buffer_info(addr, sizeof(float),
                                                     py::format_descriptor<float>::format(),
-                                                    4, shape, strides), base);
+                                                    ndim, shape, strides), base);
                         sample = arr;
                     } else {
                         sample = deserialize_python_object(static_cast<char*>(addr), rh.data_size);
                     }
 
-                    // 샘플이 dict 타입이면, reader에서 반환받은 키를 사용하여 각 key별로 데이터를 병합(concatenate)
+                    // 결과 버퍼에 저장: dict인 경우와 단일(default_key="data") 경우 분리
                     if (py::isinstance<py::dict>(sample)) {
                         py::dict sample_dict = sample.cast<py::dict>();
                         for (auto item : sample_dict) {
-                            // key와 value를 py::object로 변환 (py::handle -> py::object)
                             py::object key_obj = py::reinterpret_borrow<py::object>(item.first);
                             py::object value_obj = py::reinterpret_borrow<py::object>(item.second);
-                            // key를 문자열로 변환 (msgpack serialize 가능하도록)
-                            py::object key_str = py::str(key_obj);
-                            if (out.contains(key_str)) {
-                                py::module numpy = py::module::import("numpy");
-                                py::tuple tup = py::make_tuple(out[key_str], value_obj);
-                                py::object combined = numpy.attr("concatenate")(tup, py::arg("axis") = 0);
-                                out[key_str] = combined;
-                            } else {
-                                out[key_str] = value_obj;
-                            }
+                            std::string key_str = py::str(key_obj).cast<std::string>();
+                            merge_buffer[key_str].push_back(value_obj);
                         }
                     } else {
-                        // 샘플이 dict가 아니면, 기본 키 "data" 사용
-                        py::object default_key = py::str("data");
-                        if (out.contains(default_key)) {
-                            py::module numpy = py::module::import("numpy");
-                            py::tuple tup = py::make_tuple(out[default_key], sample);
-                            py::object combined = numpy.attr("concatenate")(tup, py::arg("axis") = 0);
-                            out[default_key] = combined;
-                        } else {
-                            out[default_key] = sample;
-                        }
+                        default_buffer.push_back(sample);
                     }
                     completed++;
                 }
             }
         }
-        return out;  // 최종적으로 dict 반환 (키는 reader에서 반환받은 값)
-    }
 
+        // 최종 결과 dict 구성: 각 key별로 한 번의 concatenate 실행
+        py::dict out;
+        py::module numpy = py::module::import("numpy");
+        // dict인 경우
+        for (auto& pair : merge_buffer) {
+            const std::string& key = pair.first;
+            const std::vector<py::object>& objs = pair.second;
+            if (objs.size() == 1) {
+                out[py::str(key)] = objs[0];
+            } else {
+                // 우선 파이썬 리스트로 변환
+                py::list arr_list;
+                for (const auto& obj : objs)
+                    arr_list.append(obj);
+                out[py::str(key)] = numpy.attr("concatenate")(arr_list, py::arg("axis")=0);
+            }
+        }
+        // 단일(default_key) 결과의 경우
+        if (!default_buffer.empty()) {
+            if (default_buffer.size() == 1)
+                out[py::str("data")] = default_buffer[0];
+            else {
+                py::list arr_list;
+                for (const auto& obj : default_buffer)
+                    arr_list.append(obj);
+                out[py::str("data")] = numpy.attr("concatenate")(arr_list, py::arg("axis")=0);
+            }
+        }
+        return out;
+    }
 
 
     void prefetch_loop() {
@@ -327,14 +352,15 @@ private:
                 DataType dtype = is_numpy ? TYPE_NUMPY : TYPE_MSGPACK;
                 std::string data;
                 size_t total_bytes = 0;
-                int64_t shape0 = 0, shape1 = 0, shape2 = 0, shape3 = 0;
+                uint8_t ndim = 0;
+                std::vector<int64_t> shape_vec;
                 if (is_numpy) {
                     py::array arr = sample.cast<py::array>();
                     auto info = arr.request();
-                    shape0 = info.shape[0];
-                    shape1 = info.ndim > 1 ? info.shape[1] : 1;
-                    shape2 = info.ndim > 2 ? info.shape[2] : 1;
-                    shape3 = info.ndim > 3 ? info.shape[3] : 1;
+                    ndim = info.ndim;
+                    shape_vec.resize(ndim);
+                    for (int i = 0; i < ndim; ++i)
+                        shape_vec[i] = info.shape[i];
                     total_bytes = info.size * info.itemsize;
                     data.assign(static_cast<char*>(info.ptr), total_bytes);
                 } else {
@@ -349,9 +375,12 @@ private:
                 std::memcpy(addr, data.data(), total_bytes);
                 munmap(addr, total_bytes);
                 close(fd);
-                ShmResultHeader result_hdr = {hdr.chunk_id, strlen(shm_name), total_bytes,
-                                              dtype, shape0, shape1, shape2, shape3};
+                // worker_loop에서는 ShmResultHeader와 함께 shape 정보를 기록
+                ShmResultHeader result_hdr = { hdr.chunk_id, strlen(shm_name), total_bytes, dtype, ndim };
                 ::write(result_fd, &result_hdr, sizeof(result_hdr));
+                if (is_numpy) {
+                    ::write(result_fd, shape_vec.data(), ndim * sizeof(int64_t));
+                }
                 ::write(result_fd, shm_name, result_hdr.shm_name_len);
             }
         }
@@ -361,7 +390,7 @@ private:
 };
 
 PYBIND11_MODULE(FastDataLoader, m) {
-    m.doc() = "C++ DataLoader with POSIX SHM + Msgpack Protocol for all Python objects (multiprocess prefetching 적용)";
+    m.doc() = "C++ DataLoader with POSIX SHM + Pickle Protocol for all Python objects (multiprocess prefetching 적용)";
     py::class_<FastDataLoader>(m, "FastDataLoader")
         .def(py::init<py::object, size_t, size_t, size_t, bool, bool, bool, size_t>(),
              py::arg("reader"),
