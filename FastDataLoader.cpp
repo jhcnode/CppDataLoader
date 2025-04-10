@@ -342,51 +342,138 @@ private:
             ssize_t nr = ::read(task_fd, &hdr, sizeof(hdr));
             if (nr == 0 || hdr.num_indices == std::numeric_limits<uint64_t>::max())
                 break;
+            
             std::vector<uint64_t> idxbuf(hdr.num_indices);
-            ::read(task_fd, idxbuf.data(), hdr.num_indices * sizeof(uint64_t));
+            size_t rb = ::read(task_fd, idxbuf.data(), hdr.num_indices * sizeof(uint64_t));
+            if (rb != hdr.num_indices * sizeof(uint64_t))
+                throw std::runtime_error("Failed to read indices");
+            
             {
                 py::gil_scoped_acquire gil;
                 py::object rdr = get_global_reader();
-                py::object sample = rdr(idxbuf[0]);
-                bool is_numpy = py::isinstance<py::array>(sample);
-                DataType dtype = is_numpy ? TYPE_NUMPY : TYPE_MSGPACK;
-                std::string data;
-                size_t total_bytes = 0;
-                uint8_t ndim = 0;
-                std::vector<int64_t> shape_vec;
-                if (is_numpy) {
-                    py::array arr = sample.cast<py::array>();
-                    auto info = arr.request();
-                    ndim = info.ndim;
-                    shape_vec.resize(ndim);
-                    for (int i = 0; i < ndim; ++i)
-                        shape_vec[i] = info.shape[i];
-                    total_bytes = info.size * info.itemsize;
-                    data.assign(static_cast<char*>(info.ptr), total_bytes);
-                } else {
-                    data = serialize_python_object(sample);
-                    total_bytes = data.size();
+                // 벡터에 모든 샘플을 수집
+                std::vector<py::object> samples;
+                samples.reserve(idxbuf.size());
+                for (auto idx : idxbuf) {
+                    py::object sample = rdr(idx);
+                    samples.push_back(sample);
                 }
+                
+                // 결과를 저장할 변수 (최종 반환 객체)
+                py::object result_sample;
+                
+                // 만약 첫번째 샘플이 dict인 경우: 각 키별로 리스트 구성 후 concatenate
+                if (py::isinstance<py::dict>(samples[0])) {
+                    py::dict combined;
+                    py::dict first_dict = samples[0].cast<py::dict>();
+                    for (auto item : first_dict) {
+                        py::object key = py::reinterpret_borrow<py::object>(item.first);
+                        py::list value_list;
+                        for (auto &sample : samples) {
+                            py::dict sample_dict = sample.cast<py::dict>();
+                            value_list.append(sample_dict[key]);
+                        }
+                        // numpy 배열은 워커보다는 메인에서 concatenate 하도록 함
+                        combined[py::str(key)] = value_list;
+                    }
+                    result_sample = combined;
+                }
+                // 만약 첫번째 샘플이 numpy 배열인 경우: 배치 단위로 연속된 메모리 영역에 복사
+                else if (py::isinstance<py::array>(samples[0])) {
+                    // 첫번째 샘플 정보 획득
+                    py::array first_arr = samples[0].cast<py::array>();
+                    auto info = first_arr.request();
+                    size_t one_sample_bytes = info.size * info.itemsize;
+                    
+                    // 모든 샘플이 동일한 모양을 갖는다고 가정
+                    size_t batch_samples = samples.size();
+                    size_t total_bytes = one_sample_bytes * batch_samples;
+                    
+                    // 전체 배치의 새로운 shape: (batch_samples, ... 기존 shape ...)
+                    std::vector<py::ssize_t> combined_shape;
+                    combined_shape.push_back(batch_samples);
+                    for (int i = 0; i < info.ndim; ++i)
+                        combined_shape.push_back(info.shape[i]);
+                    
+                    // 공유 메모리 이름 생성
+                    char shm_name[64];
+                    snprintf(shm_name, 64, "/myshm_%d_%llu", getpid(), (unsigned long long)random());
+                    
+                    int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0666);
+                    if (fd < 0)
+                        throw std::runtime_error("shm_open failed");
+                    if (ftruncate(fd, total_bytes) < 0)
+                        throw std::runtime_error("ftruncate failed");
+                    
+                    void* addr = mmap(nullptr, total_bytes, PROT_WRITE, MAP_SHARED, fd, 0);
+                    if (addr == MAP_FAILED)
+                        throw std::runtime_error("mmap failed");
+                    
+                    // 각 샘플을 연속된 버퍼에 복사
+                    for (size_t i = 0; i < batch_samples; i++) {
+                        py::array arr = samples[i].cast<py::array>();
+                        auto info_i = arr.request();
+                        if (info_i.size != info.size)
+                            throw std::runtime_error("Numpy array size mismatch in batch");
+                        std::memcpy(static_cast<char*>(addr) + i * one_sample_bytes,
+                                    info_i.ptr, one_sample_bytes);
+                    }
+                    
+                    munmap(addr, total_bytes);
+                    close(fd);
+                    
+                    // 결과 공유: 미리 계산한 combined_shape와 total_bytes 정보를 header에 포함시킴
+                    DataType dtype = TYPE_NUMPY;
+                    uint8_t ndim = combined_shape.size();
+                    std::vector<int64_t> shape_vec(combined_shape.begin(), combined_shape.end());
+                    
+                    ShmResultHeader result_hdr = { hdr.chunk_id, (uint64_t)strlen(shm_name),
+                                                total_bytes, dtype, ndim };
+                    ::write(result_fd, &result_hdr, sizeof(result_hdr));
+                    ::write(result_fd, shape_vec.data(), ndim * sizeof(int64_t));
+                    ::write(result_fd, shm_name, result_hdr.shm_name_len);
+                    
+                    // 이번 작업은 numpy의 경우 별도 처리했으므로 continue
+                    continue;
+                }
+                // 그 외의 경우(일반 파이썬 객체): 여러 샘플을 리스트로 묶어서 직렬화
+                else {
+                    py::list sample_list;
+                    for (auto &s : samples)
+                        sample_list.append(s);
+                    result_sample = sample_list;
+                }
+                
+                // numpy 배열이 아닌 경우 (또는 dict의 경우)
+                std::string data = serialize_python_object(result_sample);
+                size_t total_bytes = data.size();
+                
                 char shm_name[64];
                 snprintf(shm_name, 64, "/myshm_%d_%llu", getpid(), (unsigned long long)random());
                 int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0666);
-                ftruncate(fd, total_bytes);
+                if (fd < 0)
+                    throw std::runtime_error("shm_open failed");
+                if (ftruncate(fd, total_bytes) < 0)
+                    throw std::runtime_error("ftruncate failed");
+                
                 void* addr = mmap(nullptr, total_bytes, PROT_WRITE, MAP_SHARED, fd, 0);
+                if (addr == MAP_FAILED)
+                    throw std::runtime_error("mmap failed");
                 std::memcpy(addr, data.data(), total_bytes);
                 munmap(addr, total_bytes);
                 close(fd);
-                // worker_loop에서는 ShmResultHeader와 함께 shape 정보를 기록
-                ShmResultHeader result_hdr = { hdr.chunk_id, strlen(shm_name), total_bytes, dtype, ndim };
+                
+                // 비-넘파이 객체의 경우 ndim을 0으로 기록 (직렬화된 데이터)
+                ShmResultHeader result_hdr = { hdr.chunk_id, (uint64_t)strlen(shm_name),
+                                            total_bytes, TYPE_MSGPACK, 0 };
                 ::write(result_fd, &result_hdr, sizeof(result_hdr));
-                if (is_numpy) {
-                    ::write(result_fd, shape_vec.data(), ndim * sizeof(int64_t));
-                }
                 ::write(result_fd, shm_name, result_hdr.shm_name_len);
-            }
+            } // GIL 해제 영역 끝
         }
         close(task_fd);
         close(result_fd);
     }
+
 };
 
 PYBIND11_MODULE(FastDataLoader, m) {

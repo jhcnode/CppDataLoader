@@ -71,5 +71,5 @@ loader = FastDataLoaderWrapper(
 num_epochs = 10
 for epoch in tqdm(range(num_epochs), desc="Epoch"):
     for i, batch in enumerate(loader):
-        print(f"Epoch {epoch} -> Batch {batch['label']}")
+        print(f"Epoch {epoch} -> Batch {batch['label'].shape}")
 

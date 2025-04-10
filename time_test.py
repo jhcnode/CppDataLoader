@@ -9,7 +9,7 @@ from tqdm import tqdm
 # 가짜 Dataset 시뮬레이션
 class DummyDataset:
     def __getitem__(self, idx):
-        image = np.ones((3, 512, 512), dtype=np.float32) * idx
+        image = np.ones((3, 128, 128), dtype=np.float32) * idx
         label = np.zeros(10, dtype=np.float32)
         label[idx % 10] = 1.0
         return {"image": image, "label": label}

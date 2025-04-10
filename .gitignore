@@ -1,1 +1,5 @@
 .gitmessage.txt
+FastDataLoader.egg-info
+dist
+build
+backup
