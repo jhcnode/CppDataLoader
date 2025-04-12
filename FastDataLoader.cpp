@@ -22,13 +22,31 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <tuple>
+#include <signal.h>
+#include <sys/prctl.h>
 
 namespace py = pybind11;
 
-// 전역 reader 객체 (worker가 fork 후에도 공유)
+// 전역 reader: worker가 fork 이후에도 공유됨.
 static py::object& get_global_reader() {
     static py::object global_reader;
     return global_reader;
+}
+
+// 종료 플래그 및 SIGTERM 핸들러
+static volatile sig_atomic_t terminate_flag = 0;
+static void term_handler(int signum) {
+    terminate_flag = 1;
+}
+
+// EINTR 처리 및 종료 플래그 확인하는 robust_read 헬퍼 함수
+static ssize_t robust_read(int fd, void *buf, size_t count) {
+    ssize_t ret;
+    while ((ret = read(fd, buf, count)) < 0 && errno == EINTR && !terminate_flag) {
+        // EINTR이면 계속 시도.
+        continue;
+    }
+    return ret;
 }
 
 enum DataType : uint8_t {
@@ -41,13 +59,12 @@ struct ChunkTaskHeader {
     uint64_t num_indices;
 };
 
-// 결과 전달용 헤더. (여기서는 pickle 등 일반 데이터 처리용)
 struct ShmResultHeader {
     uint64_t chunk_id;
     uint64_t shm_name_len;
     uint64_t data_size;
     uint8_t data_type;
-    uint8_t ndim; // numpy array 차원 (shape 정보가 뒤따름)
+    uint8_t ndim;  // numpy array 차원 수
 };
 
 struct MMapContext {
@@ -55,11 +72,14 @@ struct MMapContext {
     size_t size;
 };
 
+// py::capsule의 소멸자로, 캡슐이 해제될 때 mmap 영역을 munmap한 후 MMapContext 삭제
 static void capsule_destructor(void* p) {
     auto ctx = reinterpret_cast<MMapContext*>(p);
-    if (!ctx) return;
-    munmap(ctx->addr, ctx->size);
-    delete ctx;
+    if (ctx) {
+        if (ctx->addr)
+            munmap(ctx->addr, ctx->size);
+        delete ctx;
+    }
 }
 
 std::string serialize_python_object(const py::object& obj) {
@@ -80,9 +100,9 @@ py::object deserialize_python_object(const char* data, size_t size) {
 struct GlobalKeyInfo {
     std::string key_name;
     std::string shm_name;
-    uint64_t offset;         // 이 worker가 write할 시작 offset (바이트 단위)
-    uint64_t chunk_data_size; // 이 worker가 write할 데이터 크기 (바이트 단위)
-    uint64_t total_allocated_bytes; // 전체 글로벌 shared memory 크기
+    uint64_t offset;         // worker가 데이터를 기록할 시작 offset (바이트)
+    uint64_t chunk_data_size; // worker가 기록할 데이터 크기 (바이트)
+    uint64_t total_allocated_bytes; // 전체 할당된 shared memory 크기
 };
 
 class FastDataLoader {
@@ -92,15 +112,16 @@ public:
         int task_fd;
         int result_fd;
     };
-    
+
     FastDataLoader(py::object reader, size_t dataset_len, size_t batch_size,
                    size_t num_workers, bool shuffle, bool drop_last,
                    bool persistent_workers = true, size_t prefetch_count = 5)
         : reader_(reader), dataset_len_(dataset_len), batch_size_(batch_size),
           num_workers_(num_workers), shuffle_(shuffle), drop_last_(drop_last),
           persistent_workers_(persistent_workers), current_index_(0), epoch_count_(0),
-          prefetch_count_(prefetch_count)
+          prefetch_count_(prefetch_count), prefetch_pid_(-1)
     {
+        // indices 초기화
         indices_.resize(dataset_len_);
         std::iota(indices_.begin(), indices_.end(), 0);
         if (shuffle_ && dataset_len_ > 1) {
@@ -112,13 +133,17 @@ public:
         if (persistent_workers_ && num_workers_ > 0)
             spawn_workers();
 
+        // prefetch pipe 생성 후 prefetch 프로세스 생성
         if (pipe(prefetch_pipe_) < 0)
             throw std::runtime_error("pipe 생성 실패");
         pid_t pid = fork();
         if (pid < 0) {
             throw std::runtime_error("fork 실패");
         } else if (pid == 0) {
+            // 자식 prefetch 프로세스: 부모 종료 시 자동 SIGTERM을 받도록 설정
+            prctl(PR_SET_PDEATHSIG, SIGTERM);
             close(prefetch_pipe_[0]);
+            signal(SIGTERM, term_handler);
             prefetch_loop();
             _exit(0);
         } else {
@@ -128,24 +153,27 @@ public:
     }
 
     ~FastDataLoader() {
+        // 소멸자에서 prefetch 프로세스 종료
         if (prefetch_pid_ > 0) {
             kill(prefetch_pid_, SIGTERM);
             waitpid(prefetch_pid_, nullptr, 0);
         }
-        if (persistent_workers_)
+        // persistent worker 종료
+        if (persistent_workers_) {
             shutdown_workers();
+        }
     }
 
-    // __call__에서 직렬화된 배치를 받아 deserialize 후 반환
+    // __call__ 연산자: prefetch pipe에서 직렬화된 배치를 읽어 deserialize 후 반환
     py::object operator()() {
         uint32_t batch_size_bytes;
-        ssize_t n = read(prefetch_pipe_[0], &batch_size_bytes, sizeof(batch_size_bytes));
+        ssize_t n = robust_read(prefetch_pipe_[0], &batch_size_bytes, sizeof(batch_size_bytes));
         if (n != sizeof(batch_size_bytes))
             return py::list();
         std::vector<char> buffer(batch_size_bytes);
         size_t offset = 0;
         while (offset < batch_size_bytes) {
-            ssize_t r = read(prefetch_pipe_[0], buffer.data() + offset, batch_size_bytes - offset);
+            ssize_t r = robust_read(prefetch_pipe_[0], buffer.data() + offset, batch_size_bytes - offset);
             if (r <= 0)
                 break;
             offset += r;
@@ -180,13 +208,16 @@ private:
         for (size_t i = 0; i < num_workers_; i++) {
             int task_pipe[2], result_pipe[2];
             if (pipe(task_pipe) < 0 || pipe(result_pipe) < 0)
-                throw std::runtime_error("pipe 실패");
+                throw std::runtime_error("pipe 생성 실패");
             pid_t pid = fork();
             if (pid < 0)
                 throw std::runtime_error("fork 실패");
             if (pid == 0) {
+                // 자식 worker 프로세스: 부모 종료 시 SIGTERM 받도록 설정
+                prctl(PR_SET_PDEATHSIG, SIGTERM);
                 close(task_pipe[1]);
                 close(result_pipe[0]);
+                signal(SIGTERM, term_handler);
                 worker_loop(task_pipe[0], result_pipe[1]);
                 _exit(0);
             } else {
@@ -199,6 +230,7 @@ private:
 
     void shutdown_workers() {
         for (auto& w : workers_) {
+            // 종료 요청: num_indices를 max value로 보내어 worker 종료 요청
             ChunkTaskHeader hdr = { 0, std::numeric_limits<uint64_t>::max() };
             ::write(w.task_fd, &hdr, sizeof(hdr));
             close(w.task_fd);
@@ -208,13 +240,13 @@ private:
         workers_.clear();
     }
 
-    // 배치별로 결과를 합치는 함수
+    // load_chunked_in_workers: 배치별 결과를 집계하는 함수
     py::dict load_chunked_in_workers(const std::vector<size_t>& batch_indices) {
         py::gil_scoped_acquire gil;
         size_t total = batch_indices.size();
         bool use_global_dict = false;
         {
-            // 첫 번째 샘플을 통해 타입 확인 (dict 이면서 모든 key의 값이 numpy array인 경우)
+            // 첫 번째 샘플을 통해 모든 key의 값이 numpy array인 dict인지 확인
             py::object sample_check = get_global_reader()(batch_indices[0]);
             if (py::isinstance<py::dict>(sample_check)) {
                 py::dict dict_check = sample_check.cast<py::dict>();
@@ -231,7 +263,7 @@ private:
             }
         }
         if (!use_global_dict) {
-            // 일반 처리: 기존 concatenate 방식 (이 경우 복사가 발생)
+            // 일반(non-global) 처리: 매 배치마다 결과를 복사하여 합침
             std::unordered_map<std::string, std::vector<py::object>> merge_buffer;
             std::vector<py::object> default_buffer;
             size_t chunks = workers_.size();
@@ -246,7 +278,7 @@ private:
                     continue;
                 ChunkTaskHeader hdr = { i, end - start };
                 ::write(workers_[i].task_fd, &hdr, sizeof(hdr));
-                uint8_t flag = 0;  // 비 글로벌 모드
+                uint8_t flag = 0;  // 일반(non-global) 모드
                 ::write(workers_[i].task_fd, &flag, sizeof(flag));
                 ::write(workers_[i].task_fd, batch_indices.data() + start, (end - start) * sizeof(uint64_t));
             }
@@ -256,22 +288,26 @@ private:
                 for (size_t i = 0; i < chunks; ++i) {
                     if (pfds[i].revents & POLLIN) {
                         ShmResultHeader rh;
-                        ssize_t ret = ::read(pfds[i].fd, &rh, sizeof(rh));
-                        if(ret != sizeof(rh))
+                        ssize_t ret = robust_read(pfds[i].fd, &rh, sizeof(rh));
+                        if (ret != sizeof(rh))
                             throw std::runtime_error("Failed to read header");
                         int ndim = static_cast<int>(rh.ndim);
                         std::vector<int64_t> shape_vec(ndim);
-                        ret = ::read(pfds[i].fd, shape_vec.data(), ndim * sizeof(int64_t));
-                        if(ret != ndim * static_cast<ssize_t>(sizeof(int64_t)))
+                        ret = robust_read(pfds[i].fd, shape_vec.data(), ndim * sizeof(int64_t));
+                        if (ret != ndim * static_cast<ssize_t>(sizeof(int64_t)))
                             throw std::runtime_error("Failed to read shape info");
                         std::string shm_name(rh.shm_name_len, '\0');
-                        ::read(pfds[i].fd, &shm_name[0], rh.shm_name_len);
+                        robust_read(pfds[i].fd, &shm_name[0], rh.shm_name_len);
                         int fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
+                        // mmap 후 바로 unlink: 이름 제거, cleanup은 py::capsule에서 수행
                         shm_unlink(shm_name.c_str());
-                        void* addr = mmap(nullptr, rh.data_size, PROT_READ, MAP_SHARED, fd, 0);
+                        size_t total_bytes = rh.data_size;
+                        void* addr = mmap(nullptr, total_bytes, PROT_READ, MAP_SHARED, fd, 0);
                         close(fd);
-                        auto* ctx = new MMapContext{ addr, rh.data_size };
-                        py::capsule base(ctx, &capsule_destructor);
+                        if (addr == MAP_FAILED)
+                            throw std::runtime_error("mmap failed in non-global mode");
+                        auto* ctx = new MMapContext{addr, total_bytes};
+                        py::capsule base(ctx, capsule_destructor);
                         py::object sample;
                         if (rh.data_type == TYPE_NUMPY) {
                             std::vector<py::ssize_t> shape(ndim);
@@ -329,8 +365,7 @@ private:
             }
             return out;
         } else {
-            // --- Global pre-allocation 모드 ---
-            // 1. 첫번째 샘플에서 각 key의 numpy array 정보를 얻어, 배치 전체에 대한 global shared memory 영역을 할당합니다.
+            // Global pre-allocation 모드 (zero-copy + py::capsule cleanup)
             py::object sample0 = get_global_reader()(batch_indices[0]);
             py::dict sample_dict = sample0.cast<py::dict>();
             // global_buf_info: key -> (shm_name, sample_nbytes, sample_shape, sample_strides)
@@ -356,7 +391,6 @@ private:
                 close(fd);
                 global_buf_info[key] = std::make_tuple(std::string(shm_name), sample_nbytes, sample_shape, sample_strides);
             }
-            // 2. 각 worker에게, 배치 내 자신의 할당 범위와 global shm 영역 정보(각 key에 대해 offset, chunk_data_size, 그리고 전체 할당 크기)를 전달합니다.
             size_t chunks = workers_.size();
             size_t chunk_size = (total + chunks - 1) / chunks;
             std::vector<pollfd> pfds(chunks);
@@ -399,14 +433,14 @@ private:
                 for (size_t i = 0; i < chunks; ++i) {
                     if (pfds[i].revents & POLLIN) {
                         uint64_t ack;
-                        ssize_t ret = ::read(pfds[i].fd, &ack, sizeof(ack));
+                        ssize_t ret = robust_read(pfds[i].fd, &ack, sizeof(ack));
                         if (ret != sizeof(ack))
                             throw std::runtime_error("Failed to read global dict ack");
                         completed++;
                     }
                 }
             }
-            // 3. 메인 프로세스는 각 key별로 global shm 영역을 mmap하여, 추가 copy 없이 py::array (numpy array)로 wrapping합니다.
+            // 최종 wrapping: 각 key별로 shared memory 영역을 mmap한 후, 즉시 copy()를 호출해서 일반 메모리 배열로 반환.
             py::dict out;
             py::module numpy = py::module::import("numpy");
             for (auto &pair : global_buf_info) {
@@ -415,12 +449,10 @@ private:
                 size_t sample_nbytes = std::get<1>(pair.second);
                 std::vector<py::ssize_t> sample_shape = std::get<2>(pair.second);
                 std::vector<py::ssize_t> sample_strides = std::get<3>(pair.second);
-                // 최종 global shape: (batch_size, 기존 sample_shape...)
                 std::vector<py::ssize_t> global_shape;
                 global_shape.push_back(total);
                 for (auto s : sample_shape)
                     global_shape.push_back(s);
-                // 최종 global strides: 첫 번째 차원은 sample_nbytes, 이후는 기존 sample_strides
                 std::vector<py::ssize_t> global_strides;
                 global_strides.push_back(sample_nbytes);
                 for (auto s : sample_strides)
@@ -428,22 +460,33 @@ private:
                 int fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
                 if (fd < 0)
                     throw std::runtime_error("shm_open for final result failed");
+                // unlink 이름 제거
+                shm_unlink(shm_name.c_str());
                 size_t total_bytes = sample_nbytes * total;
                 void* addr = mmap(nullptr, total_bytes, PROT_READ, MAP_SHARED, fd, 0);
                 close(fd);
+                if (addr == MAP_FAILED)
+                    throw std::runtime_error("mmap failed for final result");
                 auto* ctx = new MMapContext{addr, total_bytes};
-                py::capsule base(ctx, &capsule_destructor);
+                py::capsule base(ctx, capsule_destructor);
+                // zero-copy numpy array 생성
                 py::array arr(py::buffer_info(addr, sample_nbytes,
                     py::format_descriptor<float>::format(),
                     global_shape.size(), global_shape, global_strides), base);
-                out[py::str(key)] = arr;
+                // 즉시 copy()하여 일반 메모리 배열로 만들어, 반환 후 mmap 영역은 해제되도록 함.
+                py::array copied = arr.attr("copy")();
+                out[py::str(key)] = copied;
             }
             return out;
         }
     }
 
     void prefetch_loop() {
+        // 자식 prefetch 프로세스: 부모 종료 시 자동 SIGTERM을 받도록 설정
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
         while (true) {
+            if (terminate_flag)
+                break;
             if (current_index_ >= dataset_len_)
                 end_epoch();
             std::vector<size_t> batch_indices(
@@ -457,46 +500,51 @@ private:
             write(prefetch_pipe_[1], &size32, sizeof(size32));
             write(prefetch_pipe_[1], serialized.data(), serialized.size());
         }
+        close(prefetch_pipe_[1]);
     }
 
     void worker_loop(int task_fd, int result_fd) {
+        // 자식 worker 프로세스: 부모 종료 시 자동 SIGTERM 받도록 설정
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
         while (true) {
+            if (terminate_flag)
+                break;
             ChunkTaskHeader hdr;
-            ssize_t nr = ::read(task_fd, &hdr, sizeof(hdr));
+            ssize_t nr = robust_read(task_fd, &hdr, sizeof(hdr));
             if (nr == 0 || hdr.num_indices == std::numeric_limits<uint64_t>::max())
                 break;
             uint8_t global_flag = 0;
-            ssize_t rflag = ::read(task_fd, &global_flag, sizeof(global_flag));
+            ssize_t rflag = robust_read(task_fd, &global_flag, sizeof(global_flag));
             bool is_global_dict = (rflag == sizeof(global_flag) && global_flag == 1);
             
             std::vector<uint64_t> idxbuf(hdr.num_indices);
             std::vector<GlobalKeyInfo> key_infos;
             if (is_global_dict) {
                 uint64_t num_keys;
-                ::read(task_fd, &num_keys, sizeof(num_keys));
+                robust_read(task_fd, &num_keys, sizeof(num_keys));
                 key_infos.resize(num_keys);
                 for (size_t k = 0; k < num_keys; k++) {
                     uint64_t key_name_len;
-                    ::read(task_fd, &key_name_len, sizeof(key_name_len));
+                    robust_read(task_fd, &key_name_len, sizeof(key_name_len));
                     std::string key_name(key_name_len, '\0');
-                    ::read(task_fd, &key_name[0], key_name_len);
+                    robust_read(task_fd, &key_name[0], key_name_len);
                     uint64_t shm_name_len;
-                    ::read(task_fd, &shm_name_len, sizeof(shm_name_len));
+                    robust_read(task_fd, &shm_name_len, sizeof(shm_name_len));
                     std::string shm_name(shm_name_len, '\0');
-                    ::read(task_fd, &shm_name[0], shm_name_len);
+                    robust_read(task_fd, &shm_name[0], shm_name_len);
                     uint64_t offset;
-                    ::read(task_fd, &offset, sizeof(offset));
+                    robust_read(task_fd, &offset, sizeof(offset));
                     uint64_t chunk_data_size;
-                    ::read(task_fd, &chunk_data_size, sizeof(chunk_data_size));
+                    robust_read(task_fd, &chunk_data_size, sizeof(chunk_data_size));
                     uint64_t total_allocated_bytes;
-                    ::read(task_fd, &total_allocated_bytes, sizeof(total_allocated_bytes));
+                    robust_read(task_fd, &total_allocated_bytes, sizeof(total_allocated_bytes));
                     key_infos[k] = GlobalKeyInfo{key_name, shm_name, offset, chunk_data_size, total_allocated_bytes};
                 }
             }
             size_t idx_bytes = hdr.num_indices * sizeof(uint64_t);
             size_t offset_bytes = 0;
             while (offset_bytes < idx_bytes) {
-                ssize_t r = ::read(task_fd, reinterpret_cast<char*>(idxbuf.data()) + offset_bytes, idx_bytes - offset_bytes);
+                ssize_t r = robust_read(task_fd, reinterpret_cast<char*>(idxbuf.data()) + offset_bytes, idx_bytes - offset_bytes);
                 if (r <= 0)
                     break;
                 offset_bytes += r;
@@ -505,18 +553,15 @@ private:
             py::gil_scoped_acquire gil;
             py::object rdr = get_global_reader();
             if (is_global_dict) {
-                // [Global dict 모드] – 앞서 구현한 코드 (생략된 부분은 이전 코드 참고)
                 std::unordered_map<std::string, std::tuple<void*, uint64_t, uint64_t, uint64_t>> global_ptrs;
                 for (auto &info : key_infos) {
                     int fd = shm_open(info.shm_name.c_str(), O_RDWR, 0666);
                     if (fd < 0)
                         throw std::runtime_error("worker: shm_open failed for global dict");
-                    // 전체 영역(total_allocated_bytes)을 mmap (offset은 0으로 매핑)
                     void* base_addr = mmap(nullptr, info.total_allocated_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
                     if (base_addr == MAP_FAILED)
                         throw std::runtime_error("worker: mmap failed for global dict");
                     close(fd);
-                    // 저장: (base_addr, total_allocated_bytes, offset, chunk_data_size)
                     global_ptrs[info.key_name] = std::make_tuple(base_addr, info.total_allocated_bytes, info.offset, info.chunk_data_size);
                 }
                 for (size_t i = 0; i < idxbuf.size(); i++) {
@@ -532,7 +577,6 @@ private:
                             throw std::runtime_error("worker: key not found in global_ptrs");
                         void* base_addr = std::get<0>(it->second);
                         uint64_t offset_in_shm = std::get<2>(it->second);
-                        // destination pointer = base_addr + offset + (i * sample_nbytes)
                         void* dest = static_cast<char*>(base_addr) + offset_in_shm + i * sample_nbytes;
                         std::memcpy(dest, info.ptr, sample_nbytes);
                     }
@@ -545,34 +589,27 @@ private:
                 uint64_t ack = hdr.chunk_id;
                 ::write(result_fd, &ack, sizeof(ack));
             } else if (py::isinstance<py::array>(rdr(0))) {
-                // 기존 numpy array 처리 방식 (비글로벌 모드)
                 std::vector<py::object> samples;
                 samples.reserve(idxbuf.size());
                 for (auto idx : idxbuf) {
                     py::object sample = rdr(idx);
                     samples.push_back(sample);
                 }
-                // 첫번째 numpy array의 정보를 얻어 배치 전체의 contiguous 영역 크기를 계산합니다.
                 py::array first_arr = samples[0].cast<py::array>();
                 auto info = first_arr.request();
                 size_t one_sample_bytes = info.size * info.itemsize;
                 size_t batch_samples = samples.size();
                 size_t total_bytes = one_sample_bytes * batch_samples;
-                
-                // 새로운 shape: (batch_samples, info.shape[0], info.shape[1], ..., info.shape[ndim-1])
                 std::vector<py::ssize_t> combined_shape;
                 combined_shape.push_back(batch_samples);
                 for (int j = 0; j < info.ndim; j++) {
                     combined_shape.push_back(info.shape[j]);
                 }
-                // 새로운 strides: 첫 번째 차원은 one_sample_bytes, 이후는 기존 strides
                 std::vector<py::ssize_t> combined_strides;
                 combined_strides.push_back(one_sample_bytes);
                 for (int j = 0; j < info.ndim; j++) {
                     combined_strides.push_back(info.strides[j]);
                 }
-                
-                // 공유 메모리 영역 생성
                 char shm_name[64];
                 snprintf(shm_name, 64, "/myshm_%d_%llu", getpid(), (unsigned long long)random());
                 int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0666);
@@ -583,7 +620,6 @@ private:
                 void* addr = mmap(nullptr, total_bytes, PROT_WRITE, MAP_SHARED, fd, 0);
                 if (addr == MAP_FAILED)
                     throw std::runtime_error("worker: mmap failed for numpy array");
-                // 각 샘플의 데이터를 연속된 메모리 영역에 복사합니다.
                 for (size_t i = 0; i < batch_samples; i++) {
                     py::array arr = samples[i].cast<py::array>();
                     auto info_i = arr.request();
@@ -594,7 +630,6 @@ private:
                 munmap(addr, total_bytes);
                 close(fd);
                 
-                // 결과 헤더 작성 및 전송
                 DataType dtype = TYPE_NUMPY;
                 uint8_t ndim = combined_shape.size();
                 ShmResultHeader result_hdr;
@@ -604,7 +639,6 @@ private:
                 result_hdr.data_type = dtype;
                 result_hdr.ndim = ndim;
                 ::write(result_fd, &result_hdr, sizeof(result_hdr));
-                // shape 정보는 int64_t 단위로 전송
                 std::vector<int64_t> shape_vec(ndim);
                 for (size_t j = 0; j < combined_shape.size(); j++) {
                     shape_vec[j] = combined_shape[j];
@@ -612,7 +646,6 @@ private:
                 ::write(result_fd, shape_vec.data(), ndim * sizeof(int64_t));
                 ::write(result_fd, shm_name, result_hdr.shm_name_len);
             } else {
-                // 기타 유형: pickle 직렬화 방식
                 std::vector<py::object> samples;
                 samples.reserve(idxbuf.size());
                 for (auto idx : idxbuf) {
@@ -646,11 +679,10 @@ private:
         close(task_fd);
         close(result_fd);
     }
-
 };
 
 PYBIND11_MODULE(FastDataLoader, m) {
-    m.doc() = "C++ DataLoader with POSIX SHM + Pickle Protocol for all Python objects (multiprocess prefetching 적용)";
+    m.doc() = "C++ DataLoader with POSIX SHM and forced cleanup on DataLoader destruction";
     py::class_<FastDataLoader>(m, "FastDataLoader")
         .def(py::init<py::object, size_t, size_t, size_t, bool, bool, bool, size_t>(),
              py::arg("reader"),
