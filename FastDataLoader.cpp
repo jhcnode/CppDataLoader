@@ -459,7 +459,6 @@ private:
         }
     }
 
-    // worker_loop: global dict 모드와 비글로벌 모드 모두 처리
     void worker_loop(int task_fd, int result_fd) {
         while (true) {
             ChunkTaskHeader hdr;
@@ -506,13 +505,13 @@ private:
             py::gil_scoped_acquire gil;
             py::object rdr = get_global_reader();
             if (is_global_dict) {
-                // 각 key에 대해, 전달받은 global shm 정보를 이용해 전체 영역을 mmap한 후, 원하는 offset에서 데이터를 copy
+                // [Global dict 모드] – 앞서 구현한 코드 (생략된 부분은 이전 코드 참고)
                 std::unordered_map<std::string, std::tuple<void*, uint64_t, uint64_t, uint64_t>> global_ptrs;
                 for (auto &info : key_infos) {
                     int fd = shm_open(info.shm_name.c_str(), O_RDWR, 0666);
                     if (fd < 0)
                         throw std::runtime_error("worker: shm_open failed for global dict");
-                    // worker는 전체 영역(total_allocated_bytes)을 mmap합니다.
+                    // 전체 영역(total_allocated_bytes)을 mmap (offset은 0으로 매핑)
                     void* base_addr = mmap(nullptr, info.total_allocated_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
                     if (base_addr == MAP_FAILED)
                         throw std::runtime_error("worker: mmap failed for global dict");
@@ -520,7 +519,6 @@ private:
                     // 저장: (base_addr, total_allocated_bytes, offset, chunk_data_size)
                     global_ptrs[info.key_name] = std::make_tuple(base_addr, info.total_allocated_bytes, info.offset, info.chunk_data_size);
                 }
-                // 각 인덱스에 대해, reader를 호출하여 dict를 얻고, 각 key의 데이터를 memcpy할 위치는 (base_addr + offset)입니다.
                 for (size_t i = 0; i < idxbuf.size(); i++) {
                     py::object sample = rdr(idxbuf[i]);
                     py::dict sample_dict = sample.cast<py::dict>();
@@ -529,17 +527,16 @@ private:
                         py::array arr = item.second.cast<py::array>();
                         auto info = arr.request();
                         size_t sample_nbytes = info.size * info.itemsize;
-                        // destination pointer = base_addr + offset + (i * sample_nbytes)
                         auto it = global_ptrs.find(key);
                         if (it == global_ptrs.end())
                             throw std::runtime_error("worker: key not found in global_ptrs");
                         void* base_addr = std::get<0>(it->second);
                         uint64_t offset_in_shm = std::get<2>(it->second);
+                        // destination pointer = base_addr + offset + (i * sample_nbytes)
                         void* dest = static_cast<char*>(base_addr) + offset_in_shm + i * sample_nbytes;
                         std::memcpy(dest, info.ptr, sample_nbytes);
                     }
                 }
-                // 각 key에 대해, 매핑한 전체 영역을 해제합니다.
                 for (auto &p : global_ptrs) {
                     void* base_addr = std::get<0>(p.second);
                     uint64_t total_alloc_size = std::get<1>(p.second);
@@ -548,8 +545,72 @@ private:
                 uint64_t ack = hdr.chunk_id;
                 ::write(result_fd, &ack, sizeof(ack));
             } else if (py::isinstance<py::array>(rdr(0))) {
-                // 기존 numpy array 처리 (비글로벌 모드)
-                // 생략
+                // 기존 numpy array 처리 방식 (비글로벌 모드)
+                std::vector<py::object> samples;
+                samples.reserve(idxbuf.size());
+                for (auto idx : idxbuf) {
+                    py::object sample = rdr(idx);
+                    samples.push_back(sample);
+                }
+                // 첫번째 numpy array의 정보를 얻어 배치 전체의 contiguous 영역 크기를 계산합니다.
+                py::array first_arr = samples[0].cast<py::array>();
+                auto info = first_arr.request();
+                size_t one_sample_bytes = info.size * info.itemsize;
+                size_t batch_samples = samples.size();
+                size_t total_bytes = one_sample_bytes * batch_samples;
+                
+                // 새로운 shape: (batch_samples, info.shape[0], info.shape[1], ..., info.shape[ndim-1])
+                std::vector<py::ssize_t> combined_shape;
+                combined_shape.push_back(batch_samples);
+                for (int j = 0; j < info.ndim; j++) {
+                    combined_shape.push_back(info.shape[j]);
+                }
+                // 새로운 strides: 첫 번째 차원은 one_sample_bytes, 이후는 기존 strides
+                std::vector<py::ssize_t> combined_strides;
+                combined_strides.push_back(one_sample_bytes);
+                for (int j = 0; j < info.ndim; j++) {
+                    combined_strides.push_back(info.strides[j]);
+                }
+                
+                // 공유 메모리 영역 생성
+                char shm_name[64];
+                snprintf(shm_name, 64, "/myshm_%d_%llu", getpid(), (unsigned long long)random());
+                int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0666);
+                if (fd < 0)
+                    throw std::runtime_error("worker: shm_open failed for numpy array");
+                if (ftruncate(fd, total_bytes) < 0)
+                    throw std::runtime_error("worker: ftruncate failed for numpy array");
+                void* addr = mmap(nullptr, total_bytes, PROT_WRITE, MAP_SHARED, fd, 0);
+                if (addr == MAP_FAILED)
+                    throw std::runtime_error("worker: mmap failed for numpy array");
+                // 각 샘플의 데이터를 연속된 메모리 영역에 복사합니다.
+                for (size_t i = 0; i < batch_samples; i++) {
+                    py::array arr = samples[i].cast<py::array>();
+                    auto info_i = arr.request();
+                    if (info_i.size * info_i.itemsize != one_sample_bytes)
+                        throw std::runtime_error("worker: numpy array size mismatch in batch");
+                    std::memcpy(static_cast<char*>(addr) + i * one_sample_bytes, info_i.ptr, one_sample_bytes);
+                }
+                munmap(addr, total_bytes);
+                close(fd);
+                
+                // 결과 헤더 작성 및 전송
+                DataType dtype = TYPE_NUMPY;
+                uint8_t ndim = combined_shape.size();
+                ShmResultHeader result_hdr;
+                result_hdr.chunk_id = hdr.chunk_id;
+                result_hdr.shm_name_len = strlen(shm_name);
+                result_hdr.data_size = total_bytes;
+                result_hdr.data_type = dtype;
+                result_hdr.ndim = ndim;
+                ::write(result_fd, &result_hdr, sizeof(result_hdr));
+                // shape 정보는 int64_t 단위로 전송
+                std::vector<int64_t> shape_vec(ndim);
+                for (size_t j = 0; j < combined_shape.size(); j++) {
+                    shape_vec[j] = combined_shape[j];
+                }
+                ::write(result_fd, shape_vec.data(), ndim * sizeof(int64_t));
+                ::write(result_fd, shm_name, result_hdr.shm_name_len);
             } else {
                 // 기타 유형: pickle 직렬화 방식
                 std::vector<py::object> samples;
@@ -585,6 +646,7 @@ private:
         close(task_fd);
         close(result_fd);
     }
+
 };
 
 PYBIND11_MODULE(FastDataLoader, m) {
