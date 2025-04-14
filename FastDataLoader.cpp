@@ -1,688 +1,691 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
-#include <vector>
-#include <string>
-#include <cstring>
-#include <random>
-#include <algorithm>
-#include <numeric>
-#include <stdexcept>
-#include <cstdint>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <poll.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <limits>
-#include <sstream>
-#include <cstdlib>
-#include <unordered_map>
-#include <tuple>
-#include <signal.h>
-#include <sys/prctl.h>
-
+#include <pybind11/functional.h>
 namespace py = pybind11;
 
-// 전역 reader: worker가 fork 이후에도 공유됨.
-static py::object& get_global_reader() {
-    static py::object global_reader;
-    return global_reader;
-}
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <sys/prctl.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
-// 종료 플래그 및 SIGTERM 핸들러
-static volatile sig_atomic_t terminate_flag = 0;
-static void term_handler(int signum) {
-    terminate_flag = 1;
-}
+#include <cstring>
+#include <cstdlib>
+#include <stdexcept>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <queue>
+#include <vector>
+#include <unordered_map>
+#include <sstream>
+#include <iostream>
+#include <random>
+#include <chrono>
 
-// EINTR 처리 및 종료 플래그 확인하는 robust_read 헬퍼 함수
-static ssize_t robust_read(int fd, void *buf, size_t count) {
-    ssize_t ret;
-    while ((ret = read(fd, buf, count)) < 0 && errno == EINTR && !terminate_flag) {
-        // EINTR이면 계속 시도.
-        continue;
-    }
-    return ret;
-}
+#include <cstdint>
+#include <endian.h>
 
-enum DataType : uint8_t {
-    TYPE_NUMPY = 0,
-    TYPE_MSGPACK = 1
-};
-
-struct ChunkTaskHeader {
-    uint64_t chunk_id;
-    uint64_t num_indices;
-};
-
-struct ShmResultHeader {
-    uint64_t chunk_id;
-    uint64_t shm_name_len;
-    uint64_t data_size;
-    uint8_t data_type;
-    uint8_t ndim;  // numpy array 차원 수
-};
-
-struct MMapContext {
-    void* addr;
-    size_t size;
-};
-
-// py::capsule의 소멸자로, 캡슐이 해제될 때 mmap 영역을 munmap한 후 MMapContext 삭제
-static void capsule_destructor(void* p) {
-    auto ctx = reinterpret_cast<MMapContext*>(p);
-    if (ctx) {
-        if (ctx->addr)
-            munmap(ctx->addr, ctx->size);
-        delete ctx;
-    }
-}
-
-std::string serialize_python_object(const py::object& obj) {
-    py::module pickle = py::module::import("pickle");
-    py::object dumps = pickle.attr("dumps");
-    py::bytes data = dumps(obj, py::arg("protocol") = 4);
-    return std::string(data);
-}
-
-py::object deserialize_python_object(const char* data, size_t size) {
-    py::module pickle = py::module::import("pickle");
-    py::object loads = pickle.attr("loads");
-    py::bytes bytes_obj(data, size);
-    return loads(bytes_obj);
-}
-
-// global pre-allocation 모드에서 각 key에 대한 정보를 전달하기 위한 구조체
-struct GlobalKeyInfo {
-    std::string key_name;
-    std::string shm_name;
-    uint64_t offset;         // worker가 데이터를 기록할 시작 offset (바이트)
-    uint64_t chunk_data_size; // worker가 기록할 데이터 크기 (바이트)
-    uint64_t total_allocated_bytes; // 전체 할당된 shared memory 크기
-};
-
-class FastDataLoader {
+// ─────────────────────────────────────────────────────────────────────────────
+// MemoryPool: POSIX shared memory 관리 + mmap/munmap
+// ─────────────────────────────────────────────────────────────────────────────
+class MemoryPool {
 public:
-    struct Worker {
-        pid_t pid;
-        int task_fd;
-        int result_fd;
-    };
-
-    FastDataLoader(py::object reader, size_t dataset_len, size_t batch_size,
-                   size_t num_workers, bool shuffle, bool drop_last,
-                   bool persistent_workers = true, size_t prefetch_count = 5)
-        : reader_(reader), dataset_len_(dataset_len), batch_size_(batch_size),
-          num_workers_(num_workers), shuffle_(shuffle), drop_last_(drop_last),
-          persistent_workers_(persistent_workers), current_index_(0), epoch_count_(0),
-          prefetch_count_(prefetch_count), prefetch_pid_(-1)
-    {
-        // indices 초기화
-        indices_.resize(dataset_len_);
-        std::iota(indices_.begin(), indices_.end(), 0);
-        if (shuffle_ && dataset_len_ > 1) {
-            static thread_local std::random_device rd;
-            static thread_local std::mt19937 g(rd());
-            std::shuffle(indices_.begin(), indices_.end(), g);
+    // 공유 메모리 allocate
+    void* allocate(size_t size, std::string &shm_name_out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::string shm_name = "/fast_data_" + std::to_string(counter_++);
+        int fd = shm_open(shm_name.c_str(), O_CREAT | O_RDWR, 0666);
+        if(fd < 0)
+            throw std::runtime_error("Failed to open shm");
+        if(ftruncate(fd, size) != 0) {
+            close(fd);
+            shm_unlink(shm_name.c_str());
+            throw std::runtime_error("Failed to truncate shm");
         }
-        get_global_reader() = reader_;
-        if (persistent_workers_ && num_workers_ > 0)
-            spawn_workers();
+        void* ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if(ptr == MAP_FAILED) {
+            shm_unlink(shm_name.c_str());
+            throw std::runtime_error("Failed to mmap");
+        }
+        mapping_[ptr] = {shm_name, size};
+        shm_name_out = shm_name;
+        return ptr;
+    }
 
-        // prefetch pipe 생성 후 prefetch 프로세스 생성
-        if (pipe(prefetch_pipe_) < 0)
-            throw std::runtime_error("pipe 생성 실패");
-        pid_t pid = fork();
-        if (pid < 0) {
-            throw std::runtime_error("fork 실패");
-        } else if (pid == 0) {
-            // 자식 prefetch 프로세스: 부모 종료 시 자동 SIGTERM을 받도록 설정
-            prctl(PR_SET_PDEATHSIG, SIGTERM);
-            close(prefetch_pipe_[0]);
-            signal(SIGTERM, term_handler);
-            prefetch_loop();
-            _exit(0);
-        } else {
-            prefetch_pid_ = pid;
-            close(prefetch_pipe_[1]);
+    // 부모 프로세스 측에서 worker 가 만든 shm_name 다시 열기
+    void* openShared(const std::string &shm_name, size_t size) {
+        int fd = shm_open(shm_name.c_str(), O_RDWR, 0666);
+        if(fd < 0)
+            throw std::runtime_error("Failed to open shared memory in parent");
+        void* ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if(ptr == MAP_FAILED)
+            throw std::runtime_error("Failed to mmap in parent");
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            mapping_[ptr] = {shm_name, size};
+        }
+        return ptr;
+    }
+
+    // python capsule deleter 에서 호출 → 실제 shm unlink + unmap
+    void release(void* ptr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = mapping_.find(ptr);
+        if(it != mapping_.end()) {
+            auto &rec = it->second;
+            munmap(ptr, rec.second);
+            shm_unlink(rec.first.c_str());
+            mapping_.erase(it);
         }
     }
 
-    ~FastDataLoader() {
-        // 소멸자에서 prefetch 프로세스 종료
-        if (prefetch_pid_ > 0) {
-            kill(prefetch_pid_, SIGTERM);
-            waitpid(prefetch_pid_, nullptr, 0);
-        }
-        // persistent worker 종료
-        if (persistent_workers_) {
-            shutdown_workers();
-        }
-    }
-
-    // __call__ 연산자: prefetch pipe에서 직렬화된 배치를 읽어 deserialize 후 반환
-    py::object operator()() {
-        uint32_t batch_size_bytes;
-        ssize_t n = robust_read(prefetch_pipe_[0], &batch_size_bytes, sizeof(batch_size_bytes));
-        if (n != sizeof(batch_size_bytes))
-            return py::list();
-        std::vector<char> buffer(batch_size_bytes);
-        size_t offset = 0;
-        while (offset < batch_size_bytes) {
-            ssize_t r = robust_read(prefetch_pipe_[0], buffer.data() + offset, batch_size_bytes - offset);
-            if (r <= 0)
-                break;
-            offset += r;
-        }
-        return deserialize_python_object(buffer.data(), buffer.size());
+    static MemoryPool& instance() {
+        static MemoryPool pool;
+        return pool;
     }
 
 private:
-    py::object reader_;
-    size_t dataset_len_, batch_size_, num_workers_;
-    bool shuffle_, drop_last_, persistent_workers_;
-    size_t current_index_, epoch_count_;
-    std::vector<size_t> indices_;
-    std::vector<Worker> workers_;
-    int prefetch_pipe_[2];
-    pid_t prefetch_pid_;
-    size_t prefetch_count_;
-
-    void end_epoch() {
-        epoch_count_++;
-        current_index_ = 0;
-        if (shuffle_ && dataset_len_ > 1) {
-            static thread_local std::random_device rd;
-            static thread_local std::mt19937 g(rd());
-            std::shuffle(indices_.begin(), indices_.end(), g);
-        }
-    }
-
-    void spawn_workers() {
-        py::gil_scoped_release release;
-        workers_.resize(num_workers_);
-        for (size_t i = 0; i < num_workers_; i++) {
-            int task_pipe[2], result_pipe[2];
-            if (pipe(task_pipe) < 0 || pipe(result_pipe) < 0)
-                throw std::runtime_error("pipe 생성 실패");
-            pid_t pid = fork();
-            if (pid < 0)
-                throw std::runtime_error("fork 실패");
-            if (pid == 0) {
-                // 자식 worker 프로세스: 부모 종료 시 SIGTERM 받도록 설정
-                prctl(PR_SET_PDEATHSIG, SIGTERM);
-                close(task_pipe[1]);
-                close(result_pipe[0]);
-                signal(SIGTERM, term_handler);
-                worker_loop(task_pipe[0], result_pipe[1]);
-                _exit(0);
-            } else {
-                close(task_pipe[0]);
-                close(result_pipe[1]);
-                workers_[i] = Worker{ pid, task_pipe[1], result_pipe[0] };
-            }
-        }
-    }
-
-    void shutdown_workers() {
-        for (auto& w : workers_) {
-            // 종료 요청: num_indices를 max value로 보내어 worker 종료 요청
-            ChunkTaskHeader hdr = { 0, std::numeric_limits<uint64_t>::max() };
-            ::write(w.task_fd, &hdr, sizeof(hdr));
-            close(w.task_fd);
-            close(w.result_fd);
-            waitpid(w.pid, nullptr, 0);
-        }
-        workers_.clear();
-    }
-
-    // load_chunked_in_workers: 배치별 결과를 집계하는 함수
-    py::dict load_chunked_in_workers(const std::vector<size_t>& batch_indices) {
-        py::gil_scoped_acquire gil;
-        size_t total = batch_indices.size();
-        bool use_global_dict = false;
-        {
-            // 첫 번째 샘플을 통해 모든 key의 값이 numpy array인 dict인지 확인
-            py::object sample_check = get_global_reader()(batch_indices[0]);
-            if (py::isinstance<py::dict>(sample_check)) {
-                py::dict dict_check = sample_check.cast<py::dict>();
-                bool all_numpy = true;
-                for (auto item : dict_check) {
-                    py::object val = py::reinterpret_borrow<py::object>(item.second);
-                    if (!py::isinstance<py::array>(val)) {
-                        all_numpy = false;
-                        break;
-                    }
-                }
-                if (all_numpy)
-                    use_global_dict = true;
-            }
-        }
-        if (!use_global_dict) {
-            // 일반(non-global) 처리: 매 배치마다 결과를 복사하여 합침
-            std::unordered_map<std::string, std::vector<py::object>> merge_buffer;
-            std::vector<py::object> default_buffer;
-            size_t chunks = workers_.size();
-            size_t chunk_size = (total + chunks - 1) / chunks;
-            std::vector<pollfd> pfds(chunks);
-            for (size_t i = 0; i < chunks; ++i)
-                pfds[i] = { workers_[i].result_fd, POLLIN, 0 };
-            for (size_t i = 0; i < chunks; ++i) {
-                size_t start = i * chunk_size;
-                size_t end = std::min(start + chunk_size, total);
-                if (start >= end)
-                    continue;
-                ChunkTaskHeader hdr = { i, end - start };
-                ::write(workers_[i].task_fd, &hdr, sizeof(hdr));
-                uint8_t flag = 0;  // 일반(non-global) 모드
-                ::write(workers_[i].task_fd, &flag, sizeof(flag));
-                ::write(workers_[i].task_fd, batch_indices.data() + start, (end - start) * sizeof(uint64_t));
-            }
-            size_t completed = 0;
-            while (completed < chunks) {
-                poll(pfds.data(), pfds.size(), -1);
-                for (size_t i = 0; i < chunks; ++i) {
-                    if (pfds[i].revents & POLLIN) {
-                        ShmResultHeader rh;
-                        ssize_t ret = robust_read(pfds[i].fd, &rh, sizeof(rh));
-                        if (ret != sizeof(rh))
-                            throw std::runtime_error("Failed to read header");
-                        int ndim = static_cast<int>(rh.ndim);
-                        std::vector<int64_t> shape_vec(ndim);
-                        ret = robust_read(pfds[i].fd, shape_vec.data(), ndim * sizeof(int64_t));
-                        if (ret != ndim * static_cast<ssize_t>(sizeof(int64_t)))
-                            throw std::runtime_error("Failed to read shape info");
-                        std::string shm_name(rh.shm_name_len, '\0');
-                        robust_read(pfds[i].fd, &shm_name[0], rh.shm_name_len);
-                        int fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
-                        // mmap 후 바로 unlink: 이름 제거, cleanup은 py::capsule에서 수행
-                        shm_unlink(shm_name.c_str());
-                        size_t total_bytes = rh.data_size;
-                        void* addr = mmap(nullptr, total_bytes, PROT_READ, MAP_SHARED, fd, 0);
-                        close(fd);
-                        if (addr == MAP_FAILED)
-                            throw std::runtime_error("mmap failed in non-global mode");
-                        auto* ctx = new MMapContext{addr, total_bytes};
-                        py::capsule base(ctx, capsule_destructor);
-                        py::object sample;
-                        if (rh.data_type == TYPE_NUMPY) {
-                            std::vector<py::ssize_t> shape(ndim);
-                            for (int j = 0; j < ndim; ++j)
-                                shape[j] = static_cast<py::ssize_t>(shape_vec[j]);
-                            std::vector<py::ssize_t> strides(ndim);
-                            if(ndim > 0) {
-                                strides[ndim-1] = sizeof(float);
-                                for (int j = ndim - 2; j >= 0; --j)
-                                    strides[j] = shape[j+1] * strides[j+1];
-                            }
-                            py::array arr(py::buffer_info(addr, sizeof(float),
-                                                        py::format_descriptor<float>::format(),
-                                                        ndim, shape, strides), base);
-                            sample = arr;
-                        } else {
-                            sample = deserialize_python_object(static_cast<char*>(addr), rh.data_size);
-                        }
-                        if (py::isinstance<py::dict>(sample)) {
-                            py::dict sample_dict = sample.cast<py::dict>();
-                            for (auto item : sample_dict) {
-                                std::string key_str = py::str(item.first).cast<std::string>();
-                                merge_buffer[key_str].push_back(py::reinterpret_borrow<py::object>(item.second));
-                            }
-                        } else {
-                            default_buffer.push_back(sample);
-                        }
-                        completed++;
-                    }
-                }
-            }
-            py::dict out;
-            py::module numpy = py::module::import("numpy");
-            for (auto& pair : merge_buffer) {
-                const std::string& key = pair.first;
-                const std::vector<py::object>& objs = pair.second;
-                if (objs.size() == 1) {
-                    out[py::str(key)] = objs[0];
-                } else {
-                    py::list arr_list;
-                    for (const auto& obj : objs)
-                        arr_list.append(obj);
-                    out[py::str(key)] = numpy.attr("concatenate")(arr_list, py::arg("axis")=0);
-                }
-            }
-            if (!default_buffer.empty()) {
-                if (default_buffer.size() == 1)
-                    out[py::str("data")] = default_buffer[0];
-                else {
-                    py::list arr_list;
-                    for (const auto& obj : default_buffer)
-                        arr_list.append(obj);
-                    out[py::str("data")] = numpy.attr("concatenate")(arr_list, py::arg("axis")=0);
-                }
-            }
-            return out;
-        } else {
-            // Global pre-allocation 모드 (zero-copy + py::capsule cleanup)
-            py::object sample0 = get_global_reader()(batch_indices[0]);
-            py::dict sample_dict = sample0.cast<py::dict>();
-            // global_buf_info: key -> (shm_name, sample_nbytes, sample_shape, sample_strides)
-            std::unordered_map<std::string, std::tuple<std::string, size_t, std::vector<py::ssize_t>, std::vector<py::ssize_t>>> global_buf_info;
-            for (auto item : sample_dict) {
-                std::string key = py::str(item.first).cast<std::string>();
-                py::array arr = item.second.cast<py::array>();
-                auto info = arr.request();
-                size_t sample_nbytes = info.size * info.itemsize;
-                std::vector<py::ssize_t> sample_shape(info.shape.begin(), info.shape.end());
-                std::vector<py::ssize_t> sample_strides(info.strides.begin(), info.strides.end());
-                size_t total_bytes = sample_nbytes * total;
-                char shm_name[64];
-                snprintf(shm_name, 64, "/global_shm_%s_%d_%llu", key.c_str(), getpid(), (unsigned long long)random());
-                int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0666);
-                if (fd < 0)
-                    throw std::runtime_error("Global shm_open failed");
-                if (ftruncate(fd, total_bytes) < 0)
-                    throw std::runtime_error("Global ftruncate failed");
-                void* addr = mmap(nullptr, total_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-                if (addr == MAP_FAILED)
-                    throw std::runtime_error("Global mmap failed");
-                close(fd);
-                global_buf_info[key] = std::make_tuple(std::string(shm_name), sample_nbytes, sample_shape, sample_strides);
-            }
-            size_t chunks = workers_.size();
-            size_t chunk_size = (total + chunks - 1) / chunks;
-            std::vector<pollfd> pfds(chunks);
-            for (size_t i = 0; i < chunks; ++i)
-                pfds[i] = { workers_[i].result_fd, POLLIN, 0 };
-            for (size_t i = 0; i < chunks; ++i) {
-                size_t start = i * chunk_size;
-                size_t end = std::min(start + chunk_size, total);
-                if (start >= end)
-                    continue;
-                ChunkTaskHeader hdr = { i, end - start };
-                ::write(workers_[i].task_fd, &hdr, sizeof(hdr));
-                uint8_t flag = 1;  // global dict 모드 flag
-                ::write(workers_[i].task_fd, &flag, sizeof(flag));
-                uint64_t num_keys = global_buf_info.size();
-                ::write(workers_[i].task_fd, &num_keys, sizeof(num_keys));
-                for (auto &pair : global_buf_info) {
-                    const std::string &key = pair.first;
-                    const std::string &shm_name = std::get<0>(pair.second);
-                    size_t sample_nbytes = std::get<1>(pair.second);
-                    uint64_t offset = start * sample_nbytes;
-                    uint64_t chunk_samples = end - start;
-                    uint64_t chunk_data_size = chunk_samples * sample_nbytes;
-                    uint64_t total_allocated_bytes = sample_nbytes * total;
-                    uint64_t key_name_len = key.size();
-                    ::write(workers_[i].task_fd, &key_name_len, sizeof(key_name_len));
-                    ::write(workers_[i].task_fd, key.data(), key_name_len);
-                    uint64_t shm_name_len = shm_name.size();
-                    ::write(workers_[i].task_fd, &shm_name_len, sizeof(shm_name_len));
-                    ::write(workers_[i].task_fd, shm_name.data(), shm_name_len);
-                    ::write(workers_[i].task_fd, &offset, sizeof(offset));
-                    ::write(workers_[i].task_fd, &chunk_data_size, sizeof(chunk_data_size));
-                    ::write(workers_[i].task_fd, &total_allocated_bytes, sizeof(total_allocated_bytes));
-                }
-                ::write(workers_[i].task_fd, batch_indices.data() + start, (end - start) * sizeof(uint64_t));
-            }
-            size_t completed = 0;
-            while (completed < chunks) {
-                poll(pfds.data(), pfds.size(), -1);
-                for (size_t i = 0; i < chunks; ++i) {
-                    if (pfds[i].revents & POLLIN) {
-                        uint64_t ack;
-                        ssize_t ret = robust_read(pfds[i].fd, &ack, sizeof(ack));
-                        if (ret != sizeof(ack))
-                            throw std::runtime_error("Failed to read global dict ack");
-                        completed++;
-                    }
-                }
-            }
-            // 최종 wrapping: 각 key별로 shared memory 영역을 mmap한 후, 즉시 copy()를 호출해서 일반 메모리 배열로 반환.
-            py::dict out;
-            py::module numpy = py::module::import("numpy");
-            for (auto &pair : global_buf_info) {
-                const std::string &key = pair.first;
-                const std::string &shm_name = std::get<0>(pair.second);
-                size_t sample_nbytes = std::get<1>(pair.second);
-                std::vector<py::ssize_t> sample_shape = std::get<2>(pair.second);
-                std::vector<py::ssize_t> sample_strides = std::get<3>(pair.second);
-                std::vector<py::ssize_t> global_shape;
-                global_shape.push_back(total);
-                for (auto s : sample_shape)
-                    global_shape.push_back(s);
-                std::vector<py::ssize_t> global_strides;
-                global_strides.push_back(sample_nbytes);
-                for (auto s : sample_strides)
-                    global_strides.push_back(s);
-                int fd = shm_open(shm_name.c_str(), O_RDONLY, 0666);
-                if (fd < 0)
-                    throw std::runtime_error("shm_open for final result failed");
-                // unlink 이름 제거
-                shm_unlink(shm_name.c_str());
-                size_t total_bytes = sample_nbytes * total;
-                void* addr = mmap(nullptr, total_bytes, PROT_READ, MAP_SHARED, fd, 0);
-                close(fd);
-                if (addr == MAP_FAILED)
-                    throw std::runtime_error("mmap failed for final result");
-                auto* ctx = new MMapContext{addr, total_bytes};
-                py::capsule base(ctx, capsule_destructor);
-                // zero-copy numpy array 생성
-                py::array arr(py::buffer_info(addr, sample_nbytes,
-                    py::format_descriptor<float>::format(),
-                    global_shape.size(), global_shape, global_strides), base);
-                // 즉시 copy()하여 일반 메모리 배열로 만들어, 반환 후 mmap 영역은 해제되도록 함.
-                py::array copied = arr.attr("copy")();
-                out[py::str(key)] = copied;
-            }
-            return out;
-        }
-    }
-
-    void prefetch_loop() {
-        // 자식 prefetch 프로세스: 부모 종료 시 자동 SIGTERM을 받도록 설정
-        prctl(PR_SET_PDEATHSIG, SIGTERM);
-        while (true) {
-            if (terminate_flag)
-                break;
-            if (current_index_ >= dataset_len_)
-                end_epoch();
-            std::vector<size_t> batch_indices(
-                indices_.begin() + current_index_,
-                indices_.begin() + std::min(current_index_ + batch_size_, dataset_len_)
-            );
-            current_index_ += batch_size_;
-            py::object batch = load_chunked_in_workers(batch_indices);
-            std::string serialized = serialize_python_object(batch);
-            uint32_t size32 = serialized.size();
-            write(prefetch_pipe_[1], &size32, sizeof(size32));
-            write(prefetch_pipe_[1], serialized.data(), serialized.size());
-        }
-        close(prefetch_pipe_[1]);
-    }
-
-    void worker_loop(int task_fd, int result_fd) {
-        // 자식 worker 프로세스: 부모 종료 시 자동 SIGTERM 받도록 설정
-        prctl(PR_SET_PDEATHSIG, SIGTERM);
-        while (true) {
-            if (terminate_flag)
-                break;
-            ChunkTaskHeader hdr;
-            ssize_t nr = robust_read(task_fd, &hdr, sizeof(hdr));
-            if (nr == 0 || hdr.num_indices == std::numeric_limits<uint64_t>::max())
-                break;
-            uint8_t global_flag = 0;
-            ssize_t rflag = robust_read(task_fd, &global_flag, sizeof(global_flag));
-            bool is_global_dict = (rflag == sizeof(global_flag) && global_flag == 1);
-            
-            std::vector<uint64_t> idxbuf(hdr.num_indices);
-            std::vector<GlobalKeyInfo> key_infos;
-            if (is_global_dict) {
-                uint64_t num_keys;
-                robust_read(task_fd, &num_keys, sizeof(num_keys));
-                key_infos.resize(num_keys);
-                for (size_t k = 0; k < num_keys; k++) {
-                    uint64_t key_name_len;
-                    robust_read(task_fd, &key_name_len, sizeof(key_name_len));
-                    std::string key_name(key_name_len, '\0');
-                    robust_read(task_fd, &key_name[0], key_name_len);
-                    uint64_t shm_name_len;
-                    robust_read(task_fd, &shm_name_len, sizeof(shm_name_len));
-                    std::string shm_name(shm_name_len, '\0');
-                    robust_read(task_fd, &shm_name[0], shm_name_len);
-                    uint64_t offset;
-                    robust_read(task_fd, &offset, sizeof(offset));
-                    uint64_t chunk_data_size;
-                    robust_read(task_fd, &chunk_data_size, sizeof(chunk_data_size));
-                    uint64_t total_allocated_bytes;
-                    robust_read(task_fd, &total_allocated_bytes, sizeof(total_allocated_bytes));
-                    key_infos[k] = GlobalKeyInfo{key_name, shm_name, offset, chunk_data_size, total_allocated_bytes};
-                }
-            }
-            size_t idx_bytes = hdr.num_indices * sizeof(uint64_t);
-            size_t offset_bytes = 0;
-            while (offset_bytes < idx_bytes) {
-                ssize_t r = robust_read(task_fd, reinterpret_cast<char*>(idxbuf.data()) + offset_bytes, idx_bytes - offset_bytes);
-                if (r <= 0)
-                    break;
-                offset_bytes += r;
-            }
-            
-            py::gil_scoped_acquire gil;
-            py::object rdr = get_global_reader();
-            if (is_global_dict) {
-                std::unordered_map<std::string, std::tuple<void*, uint64_t, uint64_t, uint64_t>> global_ptrs;
-                for (auto &info : key_infos) {
-                    int fd = shm_open(info.shm_name.c_str(), O_RDWR, 0666);
-                    if (fd < 0)
-                        throw std::runtime_error("worker: shm_open failed for global dict");
-                    void* base_addr = mmap(nullptr, info.total_allocated_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-                    if (base_addr == MAP_FAILED)
-                        throw std::runtime_error("worker: mmap failed for global dict");
-                    close(fd);
-                    global_ptrs[info.key_name] = std::make_tuple(base_addr, info.total_allocated_bytes, info.offset, info.chunk_data_size);
-                }
-                for (size_t i = 0; i < idxbuf.size(); i++) {
-                    py::object sample = rdr(idxbuf[i]);
-                    py::dict sample_dict = sample.cast<py::dict>();
-                    for (auto item : sample_dict) {
-                        std::string key = py::str(item.first).cast<std::string>();
-                        py::array arr = item.second.cast<py::array>();
-                        auto info = arr.request();
-                        size_t sample_nbytes = info.size * info.itemsize;
-                        auto it = global_ptrs.find(key);
-                        if (it == global_ptrs.end())
-                            throw std::runtime_error("worker: key not found in global_ptrs");
-                        void* base_addr = std::get<0>(it->second);
-                        uint64_t offset_in_shm = std::get<2>(it->second);
-                        void* dest = static_cast<char*>(base_addr) + offset_in_shm + i * sample_nbytes;
-                        std::memcpy(dest, info.ptr, sample_nbytes);
-                    }
-                }
-                for (auto &p : global_ptrs) {
-                    void* base_addr = std::get<0>(p.second);
-                    uint64_t total_alloc_size = std::get<1>(p.second);
-                    munmap(base_addr, total_alloc_size);
-                }
-                uint64_t ack = hdr.chunk_id;
-                ::write(result_fd, &ack, sizeof(ack));
-            } else if (py::isinstance<py::array>(rdr(0))) {
-                std::vector<py::object> samples;
-                samples.reserve(idxbuf.size());
-                for (auto idx : idxbuf) {
-                    py::object sample = rdr(idx);
-                    samples.push_back(sample);
-                }
-                py::array first_arr = samples[0].cast<py::array>();
-                auto info = first_arr.request();
-                size_t one_sample_bytes = info.size * info.itemsize;
-                size_t batch_samples = samples.size();
-                size_t total_bytes = one_sample_bytes * batch_samples;
-                std::vector<py::ssize_t> combined_shape;
-                combined_shape.push_back(batch_samples);
-                for (int j = 0; j < info.ndim; j++) {
-                    combined_shape.push_back(info.shape[j]);
-                }
-                std::vector<py::ssize_t> combined_strides;
-                combined_strides.push_back(one_sample_bytes);
-                for (int j = 0; j < info.ndim; j++) {
-                    combined_strides.push_back(info.strides[j]);
-                }
-                char shm_name[64];
-                snprintf(shm_name, 64, "/myshm_%d_%llu", getpid(), (unsigned long long)random());
-                int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0666);
-                if (fd < 0)
-                    throw std::runtime_error("worker: shm_open failed for numpy array");
-                if (ftruncate(fd, total_bytes) < 0)
-                    throw std::runtime_error("worker: ftruncate failed for numpy array");
-                void* addr = mmap(nullptr, total_bytes, PROT_WRITE, MAP_SHARED, fd, 0);
-                if (addr == MAP_FAILED)
-                    throw std::runtime_error("worker: mmap failed for numpy array");
-                for (size_t i = 0; i < batch_samples; i++) {
-                    py::array arr = samples[i].cast<py::array>();
-                    auto info_i = arr.request();
-                    if (info_i.size * info_i.itemsize != one_sample_bytes)
-                        throw std::runtime_error("worker: numpy array size mismatch in batch");
-                    std::memcpy(static_cast<char*>(addr) + i * one_sample_bytes, info_i.ptr, one_sample_bytes);
-                }
-                munmap(addr, total_bytes);
-                close(fd);
-                
-                DataType dtype = TYPE_NUMPY;
-                uint8_t ndim = combined_shape.size();
-                ShmResultHeader result_hdr;
-                result_hdr.chunk_id = hdr.chunk_id;
-                result_hdr.shm_name_len = strlen(shm_name);
-                result_hdr.data_size = total_bytes;
-                result_hdr.data_type = dtype;
-                result_hdr.ndim = ndim;
-                ::write(result_fd, &result_hdr, sizeof(result_hdr));
-                std::vector<int64_t> shape_vec(ndim);
-                for (size_t j = 0; j < combined_shape.size(); j++) {
-                    shape_vec[j] = combined_shape[j];
-                }
-                ::write(result_fd, shape_vec.data(), ndim * sizeof(int64_t));
-                ::write(result_fd, shm_name, result_hdr.shm_name_len);
-            } else {
-                std::vector<py::object> samples;
-                samples.reserve(idxbuf.size());
-                for (auto idx : idxbuf) {
-                    py::object sample = rdr(idx);
-                    samples.push_back(sample);
-                }
-                py::list sample_list;
-                for (auto &s : samples)
-                    sample_list.append(s);
-                std::string data = serialize_python_object(sample_list);
-                size_t total_bytes = data.size();
-                char shm_name[64];
-                snprintf(shm_name, 64, "/myshm_%d_%llu", getpid(), (unsigned long long)random());
-                int fd = shm_open(shm_name, O_CREAT | O_EXCL | O_RDWR, 0666);
-                if (fd < 0)
-                    throw std::runtime_error("shm_open failed");
-                if (ftruncate(fd, total_bytes) < 0)
-                    throw std::runtime_error("ftruncate failed");
-                void* addr = mmap(nullptr, total_bytes, PROT_WRITE, MAP_SHARED, fd, 0);
-                if (addr == MAP_FAILED)
-                    throw std::runtime_error("mmap failed");
-                std::memcpy(addr, data.data(), total_bytes);
-                munmap(addr, total_bytes);
-                close(fd);
-                ShmResultHeader result_hdr = { hdr.chunk_id, (uint64_t)strlen(shm_name),
-                                                total_bytes, TYPE_MSGPACK, 0 };
-                ::write(result_fd, &result_hdr, sizeof(result_hdr));
-                ::write(result_fd, shm_name, result_hdr.shm_name_len);
-            }
-        }
-        close(task_fd);
-        close(result_fd);
-    }
+    std::mutex mutex_;
+    std::unordered_map<void*, std::pair<std::string, size_t>> mapping_;
+    size_t counter_ = 0;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// robust read/write (EINTR 안전 대책)
+// ─────────────────────────────────────────────────────────────────────────────
+ssize_t robust_write(int fd, const void *buf, size_t count) {
+    size_t written = 0;
+    const char* cbuf = (const char*)buf;
+    while(written < count) {
+        ssize_t ret = write(fd, cbuf + written, count - written);
+        if(ret <= 0) {
+            if(errno == EINTR) continue;
+            return ret;
+        }
+        written += ret;
+    }
+    return written;
+}
+
+ssize_t robust_read(int fd, void *buf, size_t count) {
+    size_t readn = 0;
+    char* cbuf = (char*)buf;
+    while(readn < count) {
+        ssize_t ret = read(fd, cbuf + readn, count - readn);
+        if(ret <= 0) {
+            if(errno == EINTR) continue;
+            return ret;
+        }
+        readn += ret;
+    }
+    return readn;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// endian 변환 함수
+// ─────────────────────────────────────────────────────────────────────────────
+void write_uint64(int fd, uint64_t val) {
+    val = htobe64(val);
+    robust_write(fd, &val, sizeof(val));
+}
+uint64_t read_uint64(int fd) {
+    uint64_t val;
+    robust_read(fd, &val, sizeof(val));
+    return be64toh(val);
+}
+
+// 문자열 직렬화/역직렬화
+void write_string(int fd, const std::string &s) {
+    write_uint64(fd, s.size());
+    robust_write(fd, s.data(), s.size());
+}
+std::string read_string(int fd) {
+    uint64_t len = read_uint64(fd);
+    std::string s(len, '\0');
+    robust_read(fd, &s[0], len);
+    return s;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ArrayDesc: worker -> parent 로 전달할 하나의 array 메타데이터
+// ─────────────────────────────────────────────────────────────────────────────
+struct ArrayDesc {
+    std::string key;
+    std::vector<uint64_t> shape;
+    std::vector<uint64_t> strides;
+    std::string dtype;   // "<f4", "<i4" 등 PEP 3118 포맷
+    std::string shm_name;
+    uint64_t size;       // 바이트 크기
+};
+
+// 직렬화
+std::vector<char> serialize_batch(const std::vector<ArrayDesc>& descs) {
+    std::ostringstream oss(std::ios::binary);
+    uint64_t num_desc = descs.size();
+    num_desc = htobe64(num_desc);
+    oss.write(reinterpret_cast<const char*>(&num_desc), sizeof(num_desc));
+    for(const auto &desc : descs) {
+        // key
+        uint64_t key_len = htobe64(desc.key.size());
+        oss.write(reinterpret_cast<const char*>(&key_len), sizeof(key_len));
+        oss.write(desc.key.data(), desc.key.size());
+
+        // shape
+        uint64_t ndim = htobe64(desc.shape.size());
+        oss.write(reinterpret_cast<const char*>(&ndim), sizeof(ndim));
+        for (auto d : desc.shape) {
+            uint64_t dd = htobe64(d);
+            oss.write(reinterpret_cast<const char*>(&dd), sizeof(dd));
+        }
+        // strides
+        uint64_t nstr = htobe64(desc.strides.size());
+        oss.write(reinterpret_cast<const char*>(&nstr), sizeof(nstr));
+        for (auto st : desc.strides) {
+            uint64_t sst = htobe64(st);
+            oss.write(reinterpret_cast<const char*>(&sst), sizeof(sst));
+        }
+        // dtype
+        uint64_t dt_len = htobe64(desc.dtype.size());
+        oss.write(reinterpret_cast<const char*>(&dt_len), sizeof(dt_len));
+        oss.write(desc.dtype.data(), desc.dtype.size());
+
+        // shm_name
+        uint64_t sn_len = htobe64(desc.shm_name.size());
+        oss.write(reinterpret_cast<const char*>(&sn_len), sizeof(sn_len));
+        oss.write(desc.shm_name.data(), desc.shm_name.size());
+
+        // size
+        uint64_t sz = htobe64(desc.size);
+        oss.write(reinterpret_cast<const char*>(&sz), sizeof(sz));
+    }
+    auto str = oss.str();
+    std::vector<char> buffer(str.begin(), str.end());
+    return buffer;
+}
+
+// 역직렬화
+std::vector<ArrayDesc> deserialize_batch(const std::vector<char>& buffer) {
+    std::istringstream iss(std::string(buffer.data(), buffer.size()), std::ios::binary);
+    uint64_t num_desc;
+    iss.read(reinterpret_cast<char*>(&num_desc), sizeof(num_desc));
+    num_desc = be64toh(num_desc);
+
+    std::vector<ArrayDesc> out;
+    out.reserve(num_desc);
+
+    for (size_t i = 0; i < num_desc; i++) {
+        ArrayDesc desc;
+        // key
+        uint64_t key_len;
+        iss.read(reinterpret_cast<char*>(&key_len), sizeof(key_len));
+        key_len = be64toh(key_len);
+        desc.key.resize(key_len);
+        iss.read(&desc.key[0], key_len);
+
+        // shape
+        uint64_t ndim;
+        iss.read(reinterpret_cast<char*>(&ndim), sizeof(ndim));
+        ndim = be64toh(ndim);
+        desc.shape.resize(ndim);
+        for (size_t j=0; j<ndim; j++) {
+            uint64_t dim_;
+            iss.read(reinterpret_cast<char*>(&dim_), sizeof(dim_));
+            dim_ = be64toh(dim_);
+            desc.shape[j] = dim_;
+        }
+        // strides
+        uint64_t nstr;
+        iss.read(reinterpret_cast<char*>(&nstr), sizeof(nstr));
+        nstr = be64toh(nstr);
+        desc.strides.resize(nstr);
+        for (size_t j=0; j<nstr; j++) {
+            uint64_t st_;
+            iss.read(reinterpret_cast<char*>(&st_), sizeof(st_));
+            st_ = be64toh(st_);
+            desc.strides[j] = st_;
+        }
+        // dtype
+        uint64_t dt_len;
+        iss.read(reinterpret_cast<char*>(&dt_len), sizeof(dt_len));
+        dt_len = be64toh(dt_len);
+        desc.dtype.resize(dt_len);
+        iss.read(&desc.dtype[0], dt_len);
+
+        // shm_name
+        uint64_t sn_len;
+        iss.read(reinterpret_cast<char*>(&sn_len), sizeof(sn_len));
+        sn_len = be64toh(sn_len);
+        desc.shm_name.resize(sn_len);
+        iss.read(&desc.shm_name[0], sn_len);
+
+        // size
+        uint64_t sz;
+        iss.read(reinterpret_cast<char*>(&sz), sizeof(sz));
+        sz = be64toh(sz);
+        desc.size = sz;
+
+        out.push_back(desc);
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 직렬화: worker가 batch 인덱스 목록을 받을 수 있도록
+// ─────────────────────────────────────────────────────────────────────────────
+std::vector<char> serialize_task(const std::vector<uint64_t> &indices) {
+    std::ostringstream oss(std::ios::binary);
+    uint64_t n = htobe64(indices.size());
+    oss.write(reinterpret_cast<const char*>(&n), sizeof(n));
+    for (auto idx : indices) {
+        uint64_t i_ = htobe64(idx);
+        oss.write(reinterpret_cast<const char*>(&i_), sizeof(i_));
+    }
+    auto s = oss.str();
+    return std::vector<char>(s.begin(), s.end());
+}
+
+std::vector<uint64_t> deserialize_task(int fd) {
+    uint64_t n;
+    ssize_t rr = robust_read(fd, &n, sizeof(n));
+    if(rr <= 0) {
+        // 읽을 게 없는 경우 → 종료 신호
+        return {};
+    }
+    n = be64toh(n);
+    std::vector<uint64_t> out(n);
+    for (size_t i=0; i<n; i++) {
+        uint64_t v;
+        robust_read(fd, &v, sizeof(v));
+        v = be64toh(v);
+        out[i] = v;
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 전역 shutdown 플래그 (필요 시 사용)
+// ─────────────────────────────────────────────────────────────────────────────
+std::atomic<bool> g_shutdown(false);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Worker 프로세스
+// ─────────────────────────────────────────────────────────────────────────────
+void worker_signal_handler(int signum) {
+    _exit(1);
+}
+
+// worker_main: task_fd 에서 인덱스 벡터를 받아 reader 호출 → shared memory 로 복사 → result_fd 로 결과 전송
+void worker_main(int task_fd, int result_fd, py::object reader) {
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    signal(SIGTERM, worker_signal_handler);
+    signal(SIGINT, worker_signal_handler);
+
+    while(true) {
+        auto indices = deserialize_task(task_fd);
+        if(indices.empty()) {
+            // 빈 인덱스 → 종료 신호
+            break;
+        }
+        try {
+            // GIL 획득 후 Python reader 호출
+            py::gil_scoped_acquire gil;
+            py::list idx_list;
+            for (auto i : indices) {
+                idx_list.append((py::int_)i);
+            }
+            py::object res_obj = reader(idx_list);
+            py::dict res_dict = res_obj.cast<py::dict>();
+
+            std::vector<ArrayDesc> descs;
+            for (auto item : res_dict) {
+                // key
+                auto key_str = std::string(py::str(item.first));
+                py::array arr = item.second.cast<py::array>();
+                auto info = arr.request();
+                // PEP 3118 dtype format
+                std::string dtype = info.format;   // e.g. "<f4", "<i4", etc.
+                size_t total_bytes = info.size * info.itemsize;
+
+                // shared memory allocate
+                std::string shm_name;
+                void* shm_ptr = MemoryPool::instance().allocate(total_bytes, shm_name);
+                std::memcpy(shm_ptr, info.ptr, total_bytes);
+
+                ArrayDesc d;
+                d.key = key_str;
+                for (int i=0; i<info.ndim; i++) {
+                    d.shape.push_back(info.shape[i]);
+                    d.strides.push_back(info.strides[i]);
+                }
+                d.dtype = dtype;
+                d.shm_name = shm_name;
+                d.size = total_bytes;
+                descs.push_back(d);
+            }
+
+            // 결과 직렬화 후 전송
+            auto batch_msg = serialize_batch(descs);
+            uint64_t msg_len = batch_msg.size();
+            write_uint64(result_fd, msg_len);
+            robust_write(result_fd, batch_msg.data(), batch_msg.size());
+        } catch(std::exception &e) {
+            // 에러가 나면 msg_len=0
+            uint64_t zero = 0;
+            write_uint64(result_fd, zero);
+        }
+    }
+    _exit(0);
+}
+
+// Worker 구조체
+struct Worker {
+    pid_t pid;
+    int task_fd;   // 부모가 여기로 write
+    int result_fd; // 부모가 여기서 read
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FastDataLoader 클래스
+// ─────────────────────────────────────────────────────────────────────────────
+class FastDataLoader {
+public:
+    FastDataLoader(py::object reader,
+                   size_t dataset_len,
+                   size_t batch_size,
+                   size_t num_workers,
+                   bool shuffle,
+                   bool drop_last,
+                   bool persistent_workers,
+                   size_t prefetch_count)
+    : reader_(reader),
+      dataset_len_(dataset_len),
+      batch_size_(batch_size),
+      num_workers_(num_workers),
+      shuffle_(shuffle),
+      drop_last_(drop_last),
+      persistent_workers_(persistent_workers),
+      prefetch_count_(prefetch_count),
+      current_batch_(0),
+      stop_prefetch_(false)
+    {
+        // 인덱스 목록 초기화
+        indices_.resize(dataset_len_);
+        for (size_t i=0; i<dataset_len_; i++) {
+            indices_[i] = i;
+        }
+        if(shuffle_) {
+            std::random_device rd;
+            std::mt19937 g(rd());
+            std::shuffle(indices_.begin(), indices_.end(), g);
+        }
+
+        total_batches_ = dataset_len_ / batch_size_;
+        if(!drop_last_ && (dataset_len_ % batch_size_ != 0)) {
+            total_batches_ += 1;
+        }
+
+        // worker 프로세스 생성
+        for(size_t i=0; i<num_workers_; i++) {
+            int task_pipe[2];
+            int result_pipe[2];
+            if(pipe(task_pipe) < 0) {
+                throw std::runtime_error("Failed to create task pipe");
+            }
+            if(pipe(result_pipe) < 0) {
+                close(task_pipe[0]); close(task_pipe[1]);
+                throw std::runtime_error("Failed to create result pipe");
+            }
+            pid_t pid = fork();
+            if(pid < 0)
+                throw std::runtime_error("Failed to fork worker");
+            if(pid == 0) {
+                // child
+                close(task_pipe[1]);
+                close(result_pipe[0]);
+                worker_main(task_pipe[0], result_pipe[1], reader_);
+            } else {
+                // parent
+                close(task_pipe[0]);
+                close(result_pipe[1]);
+                Worker w;
+                w.pid = pid;
+                w.task_fd = task_pipe[1];
+                w.result_fd = result_pipe[0];
+                workers_.push_back(w);
+            }
+        }
+
+        // prefetch thread 시작
+        prefetch_thread_ = std::thread(&FastDataLoader::prefetch_loop, this);
+        // 모니터 thread (worker 감시)
+        monitor_thread_ = std::thread(&FastDataLoader::monitor_workers, this);
+    }
+
+    ~FastDataLoader() {
+        shutdown();
+    }
+
+    // shutdown: worker 종료, thread join
+    void shutdown() {
+        if(stopped_) return;
+        stopped_ = true;
+        stop_prefetch_ = true;
+
+        // prefetch thread 종료 기다림
+        if(prefetch_thread_.joinable())
+            prefetch_thread_.join();
+
+        // persistent_workers 여부와 상관없이 객체 소멸 시에는 모두 종료
+        for(auto &wk : workers_) {
+            // 종료 신호: 빈 task
+            std::vector<char> empty_task = serialize_task({});
+            robust_write(wk.task_fd, empty_task.data(), empty_task.size());
+            close(wk.task_fd);
+            close(wk.result_fd);
+            int status;
+            waitpid(wk.pid, &status, 0);
+        }
+        if(monitor_thread_.joinable())
+            monitor_thread_.join();
+    }
+
+    // iterator 프로토콜
+    FastDataLoader& __iter__() {
+        return *this;
+    }
+
+    py::dict __next__() {
+        // 만약 batch 소진되면 stop_iteration
+        if(current_batch_ >= total_batches_) {
+            throw py::stop_iteration();
+        }
+        // 큐에서 하나 꺼냄
+        std::vector<char> batch_data;
+        {
+            std::unique_lock<std::mutex> lk(q_mutex_);
+            q_cv_.wait(lk, [this](){
+                return !prefetch_queue_.empty() || stop_prefetch_;
+            });
+            if(prefetch_queue_.empty()) {
+                throw py::stop_iteration();
+            }
+            batch_data = prefetch_queue_.front();
+            prefetch_queue_.pop();
+        }
+
+        auto descs = deserialize_batch(batch_data);
+        py::dict result;
+        auto &pool = MemoryPool::instance();
+        for(auto &d : descs) {
+            // open shared memory
+            void* ptr = pool.openShared(d.shm_name, d.size);
+            py::capsule cap(ptr, [](void* p) {
+                MemoryPool::instance().release(p);
+            });
+            // shape & strides
+            std::vector<ssize_t> shp(d.shape.begin(), d.shape.end());
+            std::vector<ssize_t> stds(d.strides.begin(), d.strides.end());
+            py::array arr(py::buffer_info(
+                ptr,
+                1, // itemsize는 dtype에서 파싱해야 하지만, 여기서는 1로 두고 strides 로 커버
+                d.dtype,
+                shp.size(),
+                shp,
+                stds
+            ), cap);
+            result[py::str(d.key)] = arr;
+        }
+        current_batch_++;
+        return result;
+    }
+
+    // reset(): 여러 epoch 돌릴 때 사용 → worker 유지(persistent_workers=True) 상태에서 다시 batch 0으로
+    void reset() {
+        if(!persistent_workers_) {
+            // persistent_workers=False 인 경우 reset()은 큰 의미가 없고,
+            // 보통은 epoch마다 DataLoader를 새로 만듦
+            // 여기서는 그냥 return 처리
+            return;
+        }
+        // 만약 이전 prefetch_thread 가 살아있으면 join
+        if(prefetch_thread_.joinable()) {
+            prefetch_thread_.join();
+        }
+        {
+            // 큐 비우기
+            std::lock_guard<std::mutex> lk(q_mutex_);
+            while(!prefetch_queue_.empty()) {
+                prefetch_queue_.pop();
+            }
+        }
+        // shuffle이면 다시 섞기
+        if(shuffle_) {
+            std::random_device rd;
+            std::mt19937 g(rd());
+            std::shuffle(indices_.begin(), indices_.end(), g);
+        }
+        // batch 카운트 초기화
+        current_batch_ = 0;
+
+        // total_batches_ 재계산 (데이터셋 길이가 바뀐게 아니라면 필요X)
+        // 여기서는 고정
+
+        // prefetch loop 다시 시작
+        stop_prefetch_ = false;
+        prefetch_thread_ = std::thread(&FastDataLoader::prefetch_loop, this);
+    }
+
+private:
+    // worker 모니터 스레드
+    void monitor_workers() {
+        while(!stopped_) {
+            for (auto &wk : workers_) {
+                int status;
+                pid_t res = waitpid(wk.pid, &status, WNOHANG);
+                if(res > 0) {
+                    // worker 비정상 종료
+                    std::cerr << "[FastDataLoader] Worker " << wk.pid << " terminated unexpectedly\n";
+                    stop_prefetch_ = true;
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    // prefetch thread
+    void prefetch_loop() {
+        size_t batch_idx = 0;
+        size_t worker_idx = 0;
+        auto n_workers = workers_.size();
+
+        while(batch_idx < total_batches_ && !stop_prefetch_) {
+            size_t start = batch_idx * batch_size_;
+            size_t end = start + batch_size_;
+            if(end > indices_.size()) {
+                end = indices_.size();
+                if(drop_last_) {
+                    // drop_last=true 이고 남은게 batch보다 작으면 break
+                    break;
+                }
+            }
+            std::vector<uint64_t> task_indices(indices_.begin()+start, indices_.begin()+end);
+            auto task_msg = serialize_task(task_indices);
+
+            // worker 에게 task 쓰기
+            auto &wk = workers_[worker_idx];
+            robust_write(wk.task_fd, task_msg.data(), task_msg.size());
+
+            // result 읽기
+            uint64_t msg_len = 0;
+            if(robust_read(wk.result_fd, &msg_len, sizeof(msg_len)) <= 0) {
+                stop_prefetch_ = true;
+                break;
+            }
+            msg_len = be64toh(msg_len);
+            if(msg_len == 0) {
+                // 에러 발생
+                stop_prefetch_ = true;
+                break;
+            }
+            std::vector<char> buf(msg_len);
+            if(robust_read(wk.result_fd, buf.data(), msg_len) <= 0) {
+                stop_prefetch_ = true;
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lk(q_mutex_);
+                prefetch_queue_.push(buf);
+            }
+            q_cv_.notify_one();
+
+            batch_idx++;
+            worker_idx = (worker_idx + 1) % n_workers;
+        }
+    }
+public:
+    size_t batch_size_;
+    bool drop_last_;
+private:
+    // construction params
+    py::object reader_;
+    size_t dataset_len_;
+    size_t num_workers_;
+    bool shuffle_;
+    bool persistent_workers_;
+    size_t prefetch_count_;
+
+    // data index
+    std::vector<size_t> indices_;
+    size_t total_batches_;
+    size_t current_batch_;
+
+    // worker
+    std::vector<Worker> workers_;
+    std::thread prefetch_thread_;
+    std::thread monitor_thread_;
+    std::atomic<bool> stop_prefetch_;
+    bool stopped_ = false;
+
+    // prefetch queue
+    std::queue<std::vector<char>> prefetch_queue_;
+    std::mutex q_mutex_;
+    std::condition_variable q_cv_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Python 바인딩
+// ─────────────────────────────────────────────────────────────────────────────
 PYBIND11_MODULE(FastDataLoader, m) {
-    m.doc() = "C++ DataLoader with POSIX SHM and forced cleanup on DataLoader destruction";
+    m.doc() = "FastDataLoader with persistent_workers / reset / multi-epoch support";
     py::class_<FastDataLoader>(m, "FastDataLoader")
         .def(py::init<py::object, size_t, size_t, size_t, bool, bool, bool, size_t>(),
              py::arg("reader"),
@@ -692,6 +695,12 @@ PYBIND11_MODULE(FastDataLoader, m) {
              py::arg("shuffle"),
              py::arg("drop_last"),
              py::arg("persistent_workers"),
-             py::arg("prefetch_count") = 5)
-        .def("__call__", &FastDataLoader::operator(), "Fetch next batch from prefetch pipe");
+             py::arg("prefetch_count") = 2
+        )
+        .def("__iter__", &FastDataLoader::__iter__, py::return_value_policy::reference_internal)
+        .def("__next__", &FastDataLoader::__next__)
+        .def("reset", &FastDataLoader::reset)
+        .def("shutdown", &FastDataLoader::shutdown)
+        .def_property_readonly("batch_size", [](const FastDataLoader &self) { return self.batch_size_; })
+        .def_property_readonly("drop_last", [](const FastDataLoader &self) { return self.drop_last_; });
 }
