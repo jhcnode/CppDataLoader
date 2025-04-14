@@ -2,13 +2,14 @@ import time
 import numpy as np
 from tqdm import tqdm
 import FastDataLoader as core_loader  # C++ 모듈 (setup.py 빌드 후 생성됨)
+import gc
 
 # -------------------------------
 # 가짜 Dataset 시뮬레이션
 # -------------------------------
 class DummyDataset:
     def __getitem__(self, idx):
-        image = np.ones((3, 128, 128), dtype=np.float32) * idx
+        image = np.ones((3, 512, 512), dtype=np.float32) * idx
         label = np.zeros(10, dtype=np.float32)
         label[idx % 10] = 1.0
         return {"image": image, "label": label}
@@ -102,7 +103,8 @@ for epoch in tqdm(range(trial), desc="cpp-dataloader prog"):
         print(f"\n✅ [Epoch {epoch}] Batch {batch_idx} shapes:")
         for key, value in batch.items():
             print(f"  - {key}: {value.shape}")
-
+        del batch
+        gc.collect()
     epoch_time = time.perf_counter() - start_time
     cpp_total_time += epoch_time
 

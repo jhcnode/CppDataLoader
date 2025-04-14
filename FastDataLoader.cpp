@@ -87,6 +87,17 @@ public:
         }
     }
 
+    void unlink_only(void* ptr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = mapping_.find(ptr);
+        if (it != mapping_.end()) {
+            shm_unlink(it->second.first.c_str());
+            // munmap() 은 parent 가 관리
+            // mapping_ 도 parent 가 관리
+        }
+    }
+
+
     static MemoryPool& instance() {
         static MemoryPool pool;
         return pool;
@@ -164,6 +175,7 @@ struct ArrayDesc {
     std::string dtype;   // "<f4", "<i4" 등 PEP 3118 포맷
     std::string shm_name;
     uint64_t size;       // 바이트 크기
+    void* ptr;
 };
 
 // 직렬화
@@ -328,62 +340,56 @@ void worker_main(int task_fd, int result_fd, py::object reader) {
     signal(SIGTERM, worker_signal_handler);
     signal(SIGINT, worker_signal_handler);
 
-    while(true) {
+    while (true) {
         auto indices = deserialize_task(task_fd);
-        if(indices.empty()) {
-            // 빈 인덱스 → 종료 신호
+        if (indices.empty()) {
             break;
         }
+
         try {
-            // GIL 획득 후 Python reader 호출
             py::gil_scoped_acquire gil;
             py::list idx_list;
             for (auto i : indices) {
                 idx_list.append((py::int_)i);
             }
+
             py::object res_obj = reader(idx_list);
             py::dict res_dict = res_obj.cast<py::dict>();
 
-            std::vector<ArrayDesc> descs;
+            // descriptor: 몇 개 전달하는지
+            uint64_t num_items = res_dict.size();
+            write_uint64(result_fd, num_items);
+
             for (auto item : res_dict) {
-                // key
                 auto key_str = std::string(py::str(item.first));
                 py::array arr = item.second.cast<py::array>();
                 auto info = arr.request();
-                // PEP 3118 dtype format
-                std::string dtype = info.format;   // e.g. "<f4", "<i4", etc.
+
                 size_t total_bytes = info.size * info.itemsize;
 
-                // shared memory allocate
-                std::string shm_name;
-                void* shm_ptr = MemoryPool::instance().allocate(total_bytes, shm_name);
-                std::memcpy(shm_ptr, info.ptr, total_bytes);
+                // 🔥 pipe 로 descriptor + raw data 전송
+                write_string(result_fd, key_str);
+                write_string(result_fd, info.format);
 
-                ArrayDesc d;
-                d.key = key_str;
-                for (int i=0; i<info.ndim; i++) {
-                    d.shape.push_back(info.shape[i]);
-                    d.strides.push_back(info.strides[i]);
-                }
-                d.dtype = dtype;
-                d.shm_name = shm_name;
-                d.size = total_bytes;
-                descs.push_back(d);
+                write_uint64(result_fd, info.ndim);
+                for (int i = 0; i < info.ndim; ++i) write_uint64(result_fd, info.shape[i]);
+                for (int i = 0; i < info.ndim; ++i) write_uint64(result_fd, info.strides[i]);
+
+                write_uint64(result_fd, total_bytes);
+                robust_write(result_fd, info.ptr, total_bytes);
             }
-
-            // 결과 직렬화 후 전송
-            auto batch_msg = serialize_batch(descs);
-            uint64_t msg_len = batch_msg.size();
-            write_uint64(result_fd, msg_len);
-            robust_write(result_fd, batch_msg.data(), batch_msg.size());
-        } catch(std::exception &e) {
-            // 에러가 나면 msg_len=0
+        } catch (std::exception& e) {
+            // 실패 시 num_items = 0
             uint64_t zero = 0;
             write_uint64(result_fd, zero);
         }
     }
+
     _exit(0);
 }
+
+
+
 
 // Worker 구조체
 struct Worker {
@@ -503,49 +509,64 @@ public:
     }
 
     py::dict __next__() {
-        // 만약 batch 소진되면 stop_iteration
-        if(current_batch_ >= total_batches_) {
+        if (current_batch_ >= total_batches_) {
             throw py::stop_iteration();
         }
-        // 큐에서 하나 꺼냄
+
         std::vector<char> batch_data;
+        std::vector<void*> shm_ptrs;
         {
             std::unique_lock<std::mutex> lk(q_mutex_);
-            q_cv_.wait(lk, [this](){
+            q_cv_.wait(lk, [this]() {
                 return !prefetch_queue_.empty() || stop_prefetch_;
             });
-            if(prefetch_queue_.empty()) {
+
+            if (prefetch_queue_.empty()) {
                 throw py::stop_iteration();
             }
-            batch_data = prefetch_queue_.front();
+
+            auto front = std::move(prefetch_queue_.front());
+            batch_data = std::move(front.first);
+            shm_ptrs = std::move(front.second);
             prefetch_queue_.pop();
         }
 
         auto descs = deserialize_batch(batch_data);
         py::dict result;
-        auto &pool = MemoryPool::instance();
-        for(auto &d : descs) {
-            // open shared memory
+        auto& pool = MemoryPool::instance();
+
+        for (auto& d : descs) {
             void* ptr = pool.openShared(d.shm_name, d.size);
+
             py::capsule cap(ptr, [](void* p) {
                 MemoryPool::instance().release(p);
             });
-            // shape & strides
-            std::vector<ssize_t> shp(d.shape.begin(), d.shape.end());
-            std::vector<ssize_t> stds(d.strides.begin(), d.strides.end());
+
+            std::vector<ssize_t> shape(d.shape.begin(), d.shape.end());
+            std::vector<ssize_t> strides(d.strides.begin(), d.strides.end());
+
             py::array arr(py::buffer_info(
                 ptr,
-                1, // itemsize는 dtype에서 파싱해야 하지만, 여기서는 1로 두고 strides 로 커버
+                1,
                 d.dtype,
-                shp.size(),
-                shp,
-                stds
+                shape.size(),
+                shape,
+                strides
             ), cap);
+
             result[py::str(d.key)] = arr;
         }
+
+        // ✅ 원본 pointer release
+        for (void* ptr : shm_ptrs) {
+            pool.release(ptr);
+        }
+
         current_batch_++;
         return result;
     }
+
+
 
     // reset(): 여러 epoch 돌릴 때 사용 → worker 유지(persistent_workers=True) 상태에서 다시 batch 0으로
     void reset() {
@@ -648,43 +669,65 @@ private:
         size_t worker_idx = 0;
         auto n_workers = workers_.size();
 
-        while(batch_idx < total_batches_ && !stop_prefetch_) {
+        while (batch_idx < total_batches_ && !stop_prefetch_) {
             size_t start = batch_idx * batch_size_;
             size_t end = start + batch_size_;
-            if(end > indices_.size()) {
+            if (end > indices_.size()) {
                 end = indices_.size();
-                if(drop_last_) {
-                    // drop_last=true 이고 남은게 batch보다 작으면 break
-                    break;
-                }
+                if (drop_last_) break;
             }
-            std::vector<uint64_t> task_indices(indices_.begin()+start, indices_.begin()+end);
+
+            std::vector<uint64_t> task_indices(indices_.begin() + start, indices_.begin() + end);
             auto task_msg = serialize_task(task_indices);
 
-            // worker 에게 task 쓰기
-            auto &wk = workers_[worker_idx];
+            auto& wk = workers_[worker_idx];
             robust_write(wk.task_fd, task_msg.data(), task_msg.size());
 
-            // result 읽기
-            uint64_t msg_len = 0;
-            if(robust_read(wk.result_fd, &msg_len, sizeof(msg_len)) <= 0) {
+            // 🔥 worker 가 보낸 descriptor 수신
+            uint64_t num_items = read_uint64(wk.result_fd);
+            if (num_items == 0) {
                 stop_prefetch_ = true;
                 break;
             }
-            msg_len = be64toh(msg_len);
-            if(msg_len == 0) {
-                // 에러 발생
-                stop_prefetch_ = true;
-                break;
+
+            std::vector<ArrayDesc> descs;
+            std::vector<void*> shm_ptrs;
+            for (size_t i = 0; i < num_items; ++i) {
+                auto key = read_string(wk.result_fd);
+                auto dtype = read_string(wk.result_fd);
+
+                auto ndim = read_uint64(wk.result_fd);
+                std::vector<uint64_t> shape(ndim);
+                std::vector<uint64_t> strides(ndim);
+                for (size_t j = 0; j < ndim; ++j) shape[j] = read_uint64(wk.result_fd);
+                for (size_t j = 0; j < ndim; ++j) strides[j] = read_uint64(wk.result_fd);
+
+                auto total_bytes = read_uint64(wk.result_fd);
+
+                // 🔥 parent 가 shared memory 직접 할당
+                std::string shm_name;
+                void* shm_ptr = MemoryPool::instance().allocate(total_bytes, shm_name);
+                shm_ptrs.push_back(shm_ptr); 
+                robust_read(wk.result_fd, shm_ptr, total_bytes);
+
+                ArrayDesc d;
+                d.key = key;
+                d.dtype = dtype;
+                d.shape = shape;
+                d.strides = strides;
+                d.shm_name = shm_name;
+                d.size = total_bytes;
+                d.ptr = shm_ptr;
+
+                descs.push_back(d);
             }
-            std::vector<char> buf(msg_len);
-            if(robust_read(wk.result_fd, buf.data(), msg_len) <= 0) {
-                stop_prefetch_ = true;
-                break;
-            }
+
+            // serialize batch metadata
+            auto batch_msg = serialize_batch(descs);
+
             {
                 std::lock_guard<std::mutex> lk(q_mutex_);
-                prefetch_queue_.push(buf);
+                prefetch_queue_.push(std::make_pair(batch_msg, shm_ptrs));
             }
             q_cv_.notify_one();
 
@@ -692,6 +735,9 @@ private:
             worker_idx = (worker_idx + 1) % n_workers;
         }
     }
+
+
+
 public:
     size_t batch_size_;
     bool drop_last_;
@@ -717,7 +763,7 @@ private:
     bool stopped_ = false;
 
     // prefetch queue
-    std::queue<std::vector<char>> prefetch_queue_;
+    std::queue<std::pair<std::vector<char>, std::vector<void*>>> prefetch_queue_;
     std::mutex q_mutex_;
     std::condition_variable q_cv_;
 };
