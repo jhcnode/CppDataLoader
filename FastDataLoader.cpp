@@ -549,39 +549,80 @@ public:
 
     // reset(): 여러 epoch 돌릴 때 사용 → worker 유지(persistent_workers=True) 상태에서 다시 batch 0으로
     void reset() {
-        if(!persistent_workers_) {
-            // persistent_workers=False 인 경우 reset()은 큰 의미가 없고,
-            // 보통은 epoch마다 DataLoader를 새로 만듦
-            // 여기서는 그냥 return 처리
-            return;
-        }
         // 만약 이전 prefetch_thread 가 살아있으면 join
-        if(prefetch_thread_.joinable()) {
+        if (prefetch_thread_.joinable()) {
+            stop_prefetch_ = true;
             prefetch_thread_.join();
         }
+
+        // 큐 비우기
         {
-            // 큐 비우기
             std::lock_guard<std::mutex> lk(q_mutex_);
-            while(!prefetch_queue_.empty()) {
+            while (!prefetch_queue_.empty()) {
                 prefetch_queue_.pop();
             }
         }
-        // shuffle이면 다시 섞기
-        if(shuffle_) {
+
+        // shuffle 이면 다시 섞기
+        if (shuffle_) {
             std::random_device rd;
             std::mt19937 g(rd());
             std::shuffle(indices_.begin(), indices_.end(), g);
         }
+
         // batch 카운트 초기화
         current_batch_ = 0;
 
-        // total_batches_ 재계산 (데이터셋 길이가 바뀐게 아니라면 필요X)
-        // 여기서는 고정
+        // worker process 재생성 (persistent_workers = false 일 때는 매 epoch 마다 필요)
+        if (!persistent_workers_) {
+            // 이전 worker 종료
+            for (auto &wk : workers_) {
+                std::vector<char> empty_task = serialize_task({});
+                robust_write(wk.task_fd, empty_task.data(), empty_task.size());
+                close(wk.task_fd);
+                close(wk.result_fd);
+                int status;
+                waitpid(wk.pid, &status, 0);
+            }
+            workers_.clear();
 
-        // prefetch loop 다시 시작
+            // worker 재생성
+            for (size_t i = 0; i < num_workers_; i++) {
+                int task_pipe[2];
+                int result_pipe[2];
+                if (pipe(task_pipe) < 0) {
+                    throw std::runtime_error("Failed to create task pipe");
+                }
+                if (pipe(result_pipe) < 0) {
+                    close(task_pipe[0]); close(task_pipe[1]);
+                    throw std::runtime_error("Failed to create result pipe");
+                }
+                pid_t pid = fork();
+                if (pid < 0)
+                    throw std::runtime_error("Failed to fork worker");
+                if (pid == 0) {
+                    // child
+                    close(task_pipe[1]);
+                    close(result_pipe[0]);
+                    worker_main(task_pipe[0], result_pipe[1], reader_);
+                } else {
+                    // parent
+                    close(task_pipe[0]);
+                    close(result_pipe[1]);
+                    Worker w;
+                    w.pid = pid;
+                    w.task_fd = task_pipe[1];
+                    w.result_fd = result_pipe[0];
+                    workers_.push_back(w);
+                }
+            }
+        }
+
+        // prefetch thread 다시 시작
         stop_prefetch_ = false;
         prefetch_thread_ = std::thread(&FastDataLoader::prefetch_loop, this);
     }
+
 
 private:
     // worker 모니터 스레드
